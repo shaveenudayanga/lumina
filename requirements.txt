@@ -1,0 +1,5 @@
+# Pinned dependencies for Lumina
+opencv-python==4.8.0.76
+mediapipe==0.10.14
+pyserial==3.5
+numpy==1.26.0
