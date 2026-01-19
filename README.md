@@ -53,13 +53,21 @@ Once locked, the lamp follows the user's hand in real-time using:
  ```
 
 ### Virtual Environment (recommended)
-Create and activate a venv, then install dependencies:
+Create and activate a venv, then install dependencies. **Do not commit the `.venv` directory into source control.** Instead, track your dependencies using `requirements.txt` (or a lockfile) so environments are reproducible across machines:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # macOS / Linux
 .venv\Scripts\activate     # Windows (PowerShell/CMD)
+
+# Install pinned dependencies
 pip install -r requirements.txt
+
+# If you add/remove dependencies, update the tracked requirements file
+pip freeze > requirements.txt
 ```
+
+**Why:** Committing `.venv` bloats the repository and introduces platform-specific binaries; tracking `requirements.txt` keeps the repo small and reproducible.
 
  - Install Python Dependencies (alternative)
  ```bash
