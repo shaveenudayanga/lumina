@@ -4,10 +4,32 @@ import serial
 import time
 import math
 import sys
+import argparse
+import os
 
 # --- 1. CONFIGURATION ---
-SERIAL_PORT = 'COM3'  # UPDATEME
-BAUD_RATE = 115200
+# Default serial port per OS. Update this if your device uses a different name.
+if sys.platform == 'darwin':
+    DEFAULT_SERIAL_PORT = '/dev/tty.SLAB_USBtoUART'  # common CP210x on macOS
+elif sys.platform.startswith('linux'):
+    DEFAULT_SERIAL_PORT = '/dev/ttyUSB0'  # common on Linux
+elif sys.platform.startswith('win'):
+    DEFAULT_SERIAL_PORT = 'COM3'  # common on Windows
+else:
+    DEFAULT_SERIAL_PORT = 'COM3'
+
+DEFAULT_BAUD_RATE = 115200
+
+# Command-line / environment overrides
+parser = argparse.ArgumentParser(description='Lumina Head Tracker')
+parser.add_argument('-p', '--port', default=os.getenv('LUMINA_SERIAL_PORT', DEFAULT_SERIAL_PORT), help='Serial port (override)')
+parser.add_argument('-b', '--baud', type=int, default=int(os.getenv('LUMINA_BAUD', DEFAULT_BAUD_RATE)), help='Baud rate')
+parser.add_argument('--no-arduino', action='store_true', dest='no_arduino', help='Run in simulation mode (do not open serial)')
+parser.add_argument('--auto-detect', action='store_true', dest='auto_detect', help='Auto-detect serial port (prefers USB-serial adapters)')
+args = parser.parse_args()
+
+SERIAL_PORT = args.port
+BAUD_RATE = args.baud
 
 # === THE NEW ASPECT RATIO SETTINGS ===
 # Height divided by Width.
@@ -24,13 +46,26 @@ TILT_GAIN = 0.05
 DEADZONE = 40
 
 # --- 2. HARDWARE SETUP ---
-try:
-    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-    time.sleep(2)
-    print("✅ Arduino Connected")
-except:
-    print("⚠️ Simulation Mode")
-    arduino = None
+arduino = None
+if getattr(args, 'no_arduino', False):
+    print("⚠️ Simulation Mode (forced by --no-arduino)")
+else:
+    # Optionally auto-detect a useful serial port
+    if getattr(args, 'auto_detect', False):
+        detected = detect_serial_port()
+        if detected:
+            SERIAL_PORT = detected
+            print(f"Using auto-detected port: {SERIAL_PORT}")
+        else:
+            print("No serial port auto-detected; using configured SERIAL_PORT")
+
+    try:
+        arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        time.sleep(2)
+        print("✅ Arduino Connected")
+    except Exception as e:
+        print(f"⚠️ Simulation Mode (serial error: {e})")
+        arduino = None
 
 # --- 3. AUTO-CAMERA ---
 def get_camera():

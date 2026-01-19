@@ -52,7 +52,16 @@ Once locked, the lamp follows the user's hand in real-time using:
  cd lumina-hci
  ```
 
- - Install Python Dependencies
+### Virtual Environment (recommended)
+Create and activate a venv, then install dependencies:
+```bash
+python -m venv .venv
+source .venv/bin/activate   # macOS / Linux
+.venv\Scripts\activate     # Windows (PowerShell/CMD)
+pip install -r requirements.txt
+```
+
+ - Install Python Dependencies (alternative)
  ```bash
  pip install opencv-python mediapipe pyserial numpy
  ```
@@ -71,6 +80,20 @@ Once locked, the lamp follows the user's hand in real-time using:
 ### Start the Brain
  ```bash
  python lumina_head_tracker.py
+ ```
+
+#### CLI Examples
+ - Run with auto-detected serial port (prefers USB-serial adapters):
+ ```bash
+ python lumina_head_tracker.py --auto-detect
+ ```
+ - Override serial port and baud explicitly:
+ ```bash
+ python lumina_head_tracker.py -p /dev/tty.usbserial -b 115200
+ ```
+ - Force simulation mode (no Arduino attached):
+ ```bash
+ python lumina_head_tracker.py --no-arduino
  ```
 
  - The Interaction:
