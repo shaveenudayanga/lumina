@@ -79,6 +79,15 @@ def detect_serial_port(verbose=True, pick=False):
     if verbose: print(f"Auto-detected serial port: {candidates[0]}")
     return candidates[0]
 
+# --- CAMERA HELPER ---
+def get_camera():
+    """Return an opened VideoCapture object or exit with message if none found."""
+    for index in [1, 0]:
+        cap = cv2.VideoCapture(index)
+        if cap.isOpened():
+            return cap
+    sys.exit("❌ No Camera Found")
+
 # === THE NEW ASPECT RATIO SETTINGS ===
 # Height divided by Width.
 # Normal Open Hand is usually 1.5 - 1.8
