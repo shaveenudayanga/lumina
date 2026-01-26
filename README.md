@@ -1,11 +1,26 @@
 
-# Lumina — Interactive Robotic Lamp
+# Lumina Pro — Interactive Robotic Lamp
 
 ## Overview
 
-Lumina is an interactive robotic lamp that explores non-verbal communication between humans and machines. Unlike traditional "always-on" tracking systems, Lumina uses a strict Gestural Clutch Mechanism. It ignores casual movements (scratching, resting, holding objects) and only engages when the user explicitly "opens" the channel of communication using a specific hand pose.
+Lumina Pro is an interactive robotic lamp that explores non-verbal communication between humans and machines. Unlike traditional "always-on" tracking systems, Lumina uses a strict **Gestural Clutch Mechanism**. It ignores casual movements (scratching, resting, holding objects) and only engages when the user explicitly "opens" the channel of communication using a specific hand pose.
 
-This project demonstrates Computer Vision, Embedded Control, and Natural User Interface (NUI) design.
+This project demonstrates **Computer Vision**, **Embedded Control**, **Voice AI**, and **Natural User Interface (NUI)** design.
+
+## Project Structure
+
+```
+lumina/
+├── lumina_head_tracker.py   # Standalone vision tracking (no voice)
+├── lumina_master.py         # Full system: Vision + Voice AI + Robot Control
+├── requirements.txt         # Python dependencies
+├── firmware/                # ESP32 PlatformIO project
+│   ├── platformio.ini
+│   ├── src/main.cpp
+│   └── README.md
+└── tests/                   # Unit tests
+    └── test_detect_serial.py
+```
 
 ## Key Features
 
@@ -22,124 +37,157 @@ Once locked, the lamp follows the user's hand in real-time using:
  - Soft-Start Physics: Gain variables control the acceleration/deceleration for organic, lifelike motion.
 
 🛠 Hardware Architecture
- - The Brain (Vision Processing): Laptop/PC running Python 3.11.
-  - Why? Offloading vision allows for high-FPS, complex MediaPipe models that would lag on an MCU.
- - The Body (Actuation): ESP32 Microcontroller.
-  - Role: Receives simplified coordinates (P90 T45) via Serial and drives the motors.
- - The Eye: USB Webcam (External or Integrated).
- - Actuators:
-  - 2x Micro Servos (Pan & Tilt).
-  - NeoPixel/LED Ring (Status Feedback).
 
-### Wiring Pinout (ESP32)
+| Component | Description |
+|-----------|-------------|
+| **Brain** | Laptop/PC running Python 3.11 (offloads vision for high-FPS MediaPipe) |
+| **Body**  | ESP32 DevKit V1 (receives serial commands, drives actuators) |
+| **Eye**   | USB Webcam (external or integrated) |
+| **Face**  | SSD1306 OLED Display (128x64) with animated expressions |
+| **Neck**  | 2x SG90 Micro Servos (Pan & Tilt) |
+| **Glow**  | WS2812 LED Ring (12 LEDs, breathing animation) |
+| **Voice** | I2S Microphone + Speaker (optional, for Voice AI) |
 
-| Component   | ESP32 Pin |
-|-------------|-----------|
-| Pan Servo   | GPIO 18   |
-| Tilt Servo  | GPIO 19   |
-| Status LED  | GPIO 2    |
+### Wiring Pinout (ESP32 DevKit V1)
+
+| Component    | ESP32 Pin |
+|--------------|-----------|
+| Pan Servo    | GPIO 18   |
+| Tilt Servo   | GPIO 19   |
+| OLED SDA     | GPIO 21   |
+| OLED SCL     | GPIO 22   |
+| WS2812 LED   | GPIO 5    |
+| I2S LRC      | GPIO 25   |
+| I2S BCLK     | GPIO 26   |
+| I2S DIN      | GPIO 27   |
+| Mic ADC      | GPIO 34   |
 
 ## Software Stack
 
 ### Prerequisites
- - Python: 3.10 or 3.11 (Recommended for MediaPipe stability).
- - Arduino IDE: For flashing the ESP32 firmware.
+
+- **Python**: 3.10 or 3.11 (recommended for MediaPipe stability)
+- **PlatformIO**: For building and flashing ESP32 firmware
 
 ### Installation
- - Clone the Repository
- ```bash
- git clone https://github.com/yourusername/lumina-hci.git
- cd lumina-hci
- ```
 
-### Virtual Environment (recommended)
-Create and activate a venv, then install dependencies. **Do not commit the `.venv` directory into source control.** Instead, track your dependencies using `requirements.txt` (or a lockfile) so environments are reproducible across machines:
+1. **Clone the Repository**
+   ```bash
+   git clone https://github.com/yourusername/lumina.git
+   cd lumina
+   ```
+
+2. **Set up Python Environment**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate   # macOS / Linux
+   # .venv\Scripts\activate    # Windows
+
+   pip install -r requirements.txt
+   ```
+
+3. **Flash the ESP32 Firmware**
+   ```bash
+   cd firmware
+   pio run -t upload
+   ```
+
+   > See [firmware/README.md](firmware/README.md) for more details.
+
+### Optional: Voice AI Setup
+
+To enable voice interaction with Gemini AI:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # macOS / Linux
-.venv\Scripts\activate     # Windows (PowerShell/CMD)
-
-# Install pinned dependencies
-pip install -r requirements.txt
-
-# If you add/remove dependencies, update the tracked requirements file
-pip freeze > requirements.txt
+export GEMINI_API_KEY="your-api-key-here"
 ```
 
-**Why:** Committing `.venv` bloats the repository and introduces platform-specific binaries; tracking `requirements.txt` keeps the repo small and reproducible.
-
- - Install Python Dependencies (alternative)
- ```bash
- pip install opencv-python mediapipe pyserial numpy
- ```
-
-### Flash the Firmware
-
- - Open `lumina_firmware.ino` in Arduino IDE.
- - Select Board: DOIT ESP32 DEVKIT V1 (or your specific board).
- - Upload to the microcontroller.
+Voice AI requires these optional dependencies (already in requirements.txt):
+- `google-generativeai` - Gemini API
+- `SpeechRecognition` - Voice input
+- `gTTS` + `pygame` - Voice output
 
 ## Usage Guide
 
-### Connect Hardware
- - Plug the ESP32 into the USB port.
+### Quick Start
 
-### Start the Brain
- ```bash
- python lumina_head_tracker.py
- ```
+1. **Connect Hardware**: Plug the ESP32 into USB
+2. **Start Lumina**:
+   ```bash
+   # Basic tracking only
+   python lumina_head_tracker.py --auto-detect
 
-#### CLI Examples
- - Run with auto-detected serial port (prefers USB-serial adapters):
- ```bash
- python lumina_head_tracker.py --auto-detect
- ```
- - Override serial port and baud explicitly:
- ```bash
- python lumina_head_tracker.py -p /dev/tty.usbserial -b 115200
- ```
- - Force simulation mode (no Arduino attached):
- ```bash
- python lumina_head_tracker.py --no-arduino
- ```
+   # Full system with Voice AI
+   python lumina_master.py
+   ```
 
- - The Interaction:
-  - State 1: IDLE (Red Box)
-    - The lamp is asleep. You can move freely; it will not follow.
-  - State 2: ENGAGE (Green Box)
-    - Raise your hand.
-    - Open fingers WIDE (Stretch them vertically).
-    - Visual Cue: The on-screen box will turn GREEN and the lamp will snap to look at you.
-  - State 3: CONTROL
-    - Move your hand slowly. The lamp head will mimic your movement.
-  - State 4: DISENGAGE
-    - Simply close your fist or drop your hand to stop tracking instantly.
+### CLI Options (lumina_head_tracker.py)
 
-## Algorithms Used
- - Google MediaPipe Hands: For skeletal landmark extraction (21 points).
- - Bounding Box Aspect Ratio Analysis: Ratio = BBox_Height / BBox_Width. Used to distinguish "Intent" (Open Hand) from "Noise" (Resting Hand).
- - Proportional Control Loop: Error-based servo correction for smooth following.
+| Option | Description |
+|--------|-------------|
+| `--auto-detect` | Auto-detect serial port (prefers USB-serial adapters) |
+| `--pick` | Interactively select from multiple detected ports |
+| `-p PORT` | Specify serial port manually |
+| `-b BAUD` | Specify baud rate (default: 115200) |
+| `--no-arduino` | Simulation mode (no hardware required) |
 
-### Core Logic Snippet
-```python
-if aspect_ratio > 1.3 and finger_straightness > 0.85:
-    status = "LOCKED"
-    move_servos()
-else:
-    status = "IGNORED"
+### Controls (lumina_master.py)
+
+| Key | Action |
+|-----|--------|
+| `v` | Activate voice chat |
+| `q` | Quit |
+
+### Interaction States
+
+| State | Visual Cue | Description |
+|-------|------------|-------------|
+| **IDLE** | Red box | Lamp is sleeping, ignores all movement |
+| **TRACKING** | Green box | Hand detected, lamp follows your movement |
+| **LISTENING** | Orange bar | Waiting for voice input |
+| **RESPONDING** | Blue bar | AI is speaking |
+
+### Hand Gesture Requirements
+
+- **Palm facing camera** (not back of hand)
+- **Fingers spread wide** (aspect ratio > 1.3)
+- **All fingers straight** (no curled fingers)
+- **Hand upright** (wrist below fingers)
+
+## Serial Protocol
+
+Commands sent from Python to ESP32 over serial (115200 baud):
+
+| Command | Description |
+|---------|-------------|
+| `P<pan>T<tilt>` | Move servos (e.g., `P90T45`) |
+| `F_HAPPY` | Happy face expression |
+| `F_SLEEP` | Sleep mode expression |
+| `F_TALK_START` | Start talking animation |
+| `F_TALK_STOP` | Stop talking animation |
+| `L<brightness>` | Set LED brightness (0-255) |
+
+## Algorithms
+
+- **Google MediaPipe Hands**: Skeletal landmark extraction (21 points)
+- **Bounding Box Aspect Ratio**: `Height / Width > 1.3` distinguishes "Intent" from "Noise"
+- **Finger Straightness**: "Weakest link" algorithm rejects curled fingers
+- **Proportional Control Loop**: Error-based servo correction for smooth following
+
+## Running Tests
+
+```bash
+pytest tests/ -v
 ```
 
 ## Future Improvements
- - Gesture Recognition: Adding specific gestures (e.g., "Pinch" to dim light).
- - Face Priority: Fallback to Face Tracking when no hand is detected.
- - Wireless: Porting the Serial communication to WebSocket/UDP for a fully wireless lamp.
 
-## Notes & Assistant
-- I (your coding assistant) updated this README with setup and usage instructions. If you'd like, I can also:
-  - Add a `requirements.txt` or `pyproject.toml`.
-  - Add example Arduino firmware or wiring diagrams.
-  - Create a small test harness script that simulates serial commands for development without hardware.
+- [ ] Gesture Recognition (pinch to dim, wave to greet)
+- [ ] Face Tracking fallback when no hand detected
+- [ ] Wireless mode (WebSocket/UDP instead of Serial)
+- [ ] Custom wake words
+- [ ] Emotion detection from voice tone
 
----
-If you want any of the above extras added, tell me which and I'll implement them.
+## License
+
+See [LICENSE](LICENSE) for details.

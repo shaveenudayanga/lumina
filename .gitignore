@@ -113,8 +113,13 @@ dmypy.json
 .DS_Store
 
 # Editors
-.vscode/
 .idea/
+
+# VS Code (keep .vscode/settings.json if needed)
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch/
+.vscode/*.db*
 
 # Build / firmware artifacts
 *.bin
