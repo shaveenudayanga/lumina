@@ -96,11 +96,29 @@ Once locked, the lamp follows the user's hand in real-time using:
 
 ### Optional: Voice AI Setup
 
-To enable voice interaction with Gemini AI:
+To enable voice interaction with Gemini AI you can either set an environment variable or create a local `.env` file in the project root.
+
+Option A — set it for the current shell session:
 
 ```bash
 export GEMINI_API_KEY="your-api-key-here"
 ```
+
+Option B — create a `.env` file (recommended for local dev):
+
+1. Copy the example file:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and set your key:
+
+```bash
+GEMINI_API_KEY="your-api-key-here"
+```
+
+The project already calls `load_dotenv()` so `.env` will be loaded automatically. Your `.env` file is ignored by Git (see `.gitignore`) so it is safe to keep your secret locally.
 
 Voice AI requires these optional dependencies (already in requirements.txt):
 - `google-generativeai` - Gemini API

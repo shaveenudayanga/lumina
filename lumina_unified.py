@@ -65,8 +65,10 @@ class Config:
     # Network - Device IPs (auto-discovered or set manually)
     # Set CAM_IP to your ESP32-CAM's IP address, e.g., "192.168.1.100"
     # Leave as None to use local webcam
-    BODY_IP = None          # ESP32 DevKit (auto-discover via UDP broadcast)
+    BODY_IP = "lumina.local"  # ESP32 DevKit (set to lumina.local to skip discover)
     BODY_PORT = 5005        # UDP port for body commands
+    AUDIO_IN_PORT = 5006    # Port to receive audio FROM ESP32 mic
+    AUDIO_OUT_PORT = 5007   # Port to send audio TO ESP32 speaker
     CAM_IP = None           # ESP32-CAM IP (set this if using ESP32-CAM)
     CAM_PORT = 80           # HTTP port for camera stream
     
@@ -692,276 +694,35 @@ class WakeWordDetector:
         )
         print("👂 Listening for 'Hey Lumina'...")
     
+
     def stop(self):
+        """Stop the live conversation and notify ESP32 to stop audio streaming."""
         self.running = False
-        if self._stop_listening:
-            self._stop_listening(wait_for_stop=True)
-            self._stop_listening = None
-            time.sleep(0.3)
-    
-    def pause(self):
-        self.running = False
-    
-    def resume(self):
-        if self._stop_listening:
-            self.running = True
-
-
-# ============== LIVE CONVERSATION ENGINE ==============
-class LiveConversation:
-    """Handles continuous voice conversation with Gemini Live API."""
-    
-    def __init__(self, robot: RobotController):
-        self.robot = robot
-        self.running = False
-        self.is_speaking = False  # Track when AI is speaking (for echo prevention)
-        
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not set")
-        
-        self.client = genai.Client(api_key=api_key)
-        self.pya = pyaudio.PyAudio()
-        self.input_stream = None
-        self.output_stream = None
-        
-        self.audio_input_queue = asyncio.Queue(maxsize=5)
-        self.audio_output_queue = asyncio.Queue()
-        
-        # Config using proper types
-        self.config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=Config.SYSTEM_INSTRUCTION,
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=Config.VOICE)
-                )
-            ),
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_UNSPECIFIED,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_UNSPECIFIED,
-                    prefix_padding_ms=100,
-                    silence_duration_ms=800,  # Faster response after you stop speaking
-                )
-            ),
-        )
-    
-    async def listen_microphone(self):
-        mic_info = self.pya.get_default_input_device_info()
-        self.input_stream = await asyncio.to_thread(
-            self.pya.open,
-            format=pyaudio.paInt16,
-            channels=Config.CHANNELS,
-            rate=Config.SEND_SAMPLE_RATE,
-            input=True,
-            input_device_index=int(mic_info["index"]),
-            frames_per_buffer=Config.CHUNK_SIZE,
-        )
-        
-        while self.running:
+        # Send stop command to ESP32
+        if self.robot:
             try:
-                # ECHO PREVENTION: Only capture audio when AI is NOT speaking
-                if self.is_speaking:
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # Set listening face when capturing user audio
-                if self.robot and not self.is_speaking:
-                    self.robot.set_face("LISTENING")
-                
-                data = await asyncio.to_thread(
-                    self.input_stream.read,
-                    Config.CHUNK_SIZE,
-                    exception_on_overflow=False
-                )
-                await self.audio_input_queue.put({"data": data, "mime_type": "audio/pcm"})
-            except Exception as e:
-                if self.running:
-                    print(f"⚠️ Mic: {e}")
-                break
-    
-    async def send_audio(self, session):
-        while self.running:
-            try:
-                audio = await asyncio.wait_for(self.audio_input_queue.get(), timeout=0.1)
-                await session.send_realtime_input(audio=audio)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                if self.running:
-                    print(f"⚠️ Send: {e}")
-                break
-    
-    async def receive_audio(self, session):
-        while self.running:
-            try:
-                turn = session.receive()
-                async for response in turn:
-                    if response.server_content and response.server_content.model_turn:
-                        if not self.is_speaking:
-                            self.is_speaking = True
-                            if self.robot:
-                                self.robot.talk_start()
-                            print("🤖 ", end="", flush=True)
-                        
-                        for part in response.server_content.model_turn.parts:
-                            # Handle audio
-                            if part.inline_data and isinstance(part.inline_data.data, bytes):
-                                audio_data = part.inline_data.data
-                                if len(audio_data) > 0:
-                                    await self.audio_output_queue.put(audio_data)
-                            # Handle text - detect emotion and light commands
-                            if hasattr(part, 'text') and part.text:
-                                text = part.text
-                                text_lower = text.lower()
-                                print(text, end="", flush=True)
-                                
-                                # Parse light control commands
-                                if self.robot:
-                                    # Brightness: [BRIGHTNESS:XX]
-                                    brightness_match = re.search(r'\[BRIGHTNESS:(\d+)\]', text)
-                                    if brightness_match:
-                                        level = int(brightness_match.group(1))
-                                        self.robot.set_brightness(level)
-                                    
-                                    # Color: [COLOR:name]
-                                    color_match = re.search(r'\[COLOR:(\w+)\]', text)
-                                    if color_match:
-                                        color_name = color_match.group(1)
-                                        self.robot.set_color_name(color_name)
-                                
-                                # Detect emotions from response text
-                                if self.robot:
-                                    if any(w in text_lower for w in ['haha', 'laugh', '😂', 'funny', 'joke']):
-                                        self.robot.set_face("HAPPY")
-                                    elif any(w in text_lower for w in ['love', 'heart', '❤', 'sweet', 'cute']):
-                                        self.robot.set_face("LOVE")
-                                    elif any(w in text_lower for w in ['sad', 'sorry', 'unfortunately', 'oh no']):
-                                        self.robot.set_face("SAD")
-                                    elif any(w in text_lower for w in ['wow', 'amazing', 'incredible', '!']):
-                                        self.robot.set_face("SURPRISED")
-                                    elif any(w in text_lower for w in ['hmm', 'think', 'let me', 'wonder']):
-                                        self.robot.set_face("THINKING")
-                    
-                    if response.server_content and response.server_content.interrupted:
-                        print(" [interrupted]")
-                        while not self.audio_output_queue.empty():
-                            self.audio_output_queue.get_nowait()
-                        self.is_speaking = False
-                        if self.robot:
-                            self.robot.talk_stop()
-                
-                if self.is_speaking:
-                    print()
-                    self.is_speaking = False
-                    if self.robot:
-                        self.robot.talk_stop()
-            except Exception as e:
-                if self.running:
-                    print(f"⚠️ Recv: {e}")
-                break
-    
-    async def play_audio(self):
-        self.output_stream = await asyncio.to_thread(
-            self.pya.open,
-            format=pyaudio.paInt16,
-            channels=Config.CHANNELS,
-            rate=Config.RECEIVE_SAMPLE_RATE,
-            output=True,
-        )
-        
-        while self.running:
-            try:
-                audio = await asyncio.wait_for(self.audio_output_queue.get(), timeout=0.1)
-                await asyncio.to_thread(self.output_stream.write, audio)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                if self.running:
-                    print(f"⚠️ Play: {e}")
-                break
-    
-    async def monitor_goodbye(self):
-        """Monitor for goodbye phrases using speech recognition."""
-        if not SR_AVAILABLE:
-            return
-        
-        recognizer = sr.Recognizer()
-        microphone = sr.Microphone()
-        
-        def audio_callback(recognizer, audio):
-            if not self.running:
-                return
-            try:
-                text = recognizer.recognize_google(audio, language="en-US").lower()
-                # Check for goodbye phrases
-                for phrase in Config.END_PHRASES:
-                    if phrase in text:
-                        print(f"\n👋 Heard '{phrase}' - ending conversation")
-                        self.stop()
-                        return
-            except sr.UnknownValueError:
-                pass
+                self.robot.send_command("AUDIO_STOP")
             except Exception:
                 pass
-        
-        self.goodbye_detector = recognizer.listen_in_background(
-            microphone, audio_callback, phrase_time_limit=5
-        )
-    
-    async def start_session(self):
-        """Start continuous live conversation."""
-        self.running = True
-        
-        print("\n" + "=" * 50)
-        print("  💬 LIVE CONVERSATION STARTED")
-        print("=" * 50)
-        print("💡 Just talk naturally - I'm listening!")
-        print("💡 Press 'e' in camera window to end")
-        print("-" * 50 + "\n")
-        
-        try:
-            async with self.client.aio.live.connect(
-                model=Config.LIVE_MODEL,
-                config=self.config
-            ) as session:
-                print("🟢 Connected! Say something to start...\n")
-                
-                async with asyncio.TaskGroup() as tg:
-                    tg.create_task(self.listen_microphone())
-                    tg.create_task(self.send_audio(session))
-                    tg.create_task(self.receive_audio(session))
-                    tg.create_task(self.play_audio())
-                    
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"❌ Live session error: {e}")
-        finally:
-            self.cleanup()
-    
-    def stop(self):
-        self.running = False
-    
+
     def cleanup(self):
+        """Cleanup resources after a live conversation ends."""
         self.running = False
-        # Close streams gracefully
-        if self.input_stream:
+        # Ensure ESP32 stops streaming
+        if self.robot:
             try:
-                self.input_stream.stop_stream()
-                self.input_stream.close()
+                self.robot.send_command("AUDIO_STOP")
             except Exception:
                 pass
-            self.input_stream = None
-        if self.output_stream:
-            try:
-                self.output_stream.stop_stream()
-                self.output_stream.close()
-            except Exception:
-                pass
-            self.output_stream = None
+        # Close UDP sockets
+        try:
+            self.audio_in_socket.close()
+        except Exception:
+            pass
+        try:
+            self.audio_out_socket.close()
+        except Exception:
+            pass
         print("\n💬 Live conversation ended")
 
 
@@ -1027,6 +788,7 @@ def main():
     print("\n🎮 Controls:")
     print("   👆 Touch sensor - Toggle live conversation")
     print("   🗣️  Say 'Hey Lumina' - Start live conversation (backup)")
+    print("   Press 'v' - Start live conversation (manual, no touch)")
     print("   Press 'e' - End conversation")
     print("   Press 'q' - Quit")
     print("-" * 55)
@@ -1057,6 +819,10 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        if key == ord('v') and not live_conversation:
+            # Manual start (useful when no touch sensor available)
+            print("\n🟢 Manual start requested (key 'v')")
+            wake_word_triggered.set()
         if key == ord('e') and live_conversation:
             print("\n🛑 Ending conversation...")
             live_conversation.stop()

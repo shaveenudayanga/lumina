@@ -36,6 +36,7 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
 #include <FastLED.h>
+#include <driver/i2s.h>
 
 // ============== PIN DEFINITIONS ==============
 #define PIN_SERVO_PAN    18
@@ -48,6 +49,10 @@
 #define PIN_I2S_BCLK     26
 #define PIN_I2S_DIN      27
 #define PIN_MIC_ADC      34   // MAX4466 analog out
+#define PIN_AMP_EN       14   // Amplifier enable / mute control (connect to SHDN/OE)
+#define PIN_TONE         13   // Tone output pin (use through amplifier input or coupling capacitor)
+#define TONE_LEDC_CHANNEL 0   // LEDC channel for tone generation
+
 
 // ============== HARDWARE CONSTANTS ==============
 #define SCREEN_WIDTH     128
@@ -63,6 +68,8 @@
 
 // ============== NETWORK SETTINGS ==============
 #define UDP_PORT         5005
+#define UDP_AUDIO_OUT_PORT 5006  // ESP32 sends mic audio to laptop
+#define UDP_AUDIO_IN_PORT  5007  // ESP32 receives speaker audio from laptop
 #define HOSTNAME         "lumina"
 
 // ============== TIMING CONSTANTS ==============
@@ -72,6 +79,12 @@
 #define TOUCH_DEBOUNCE       300
 #define UDP_CHECK_INTERVAL   5
 #define STATUS_SEND_INTERVAL 500
+
+// ============== AUDIO SETTINGS ==============
+#define I2S_SAMPLE_RATE      16000  // 16kHz for voice
+#define I2S_BUFFER_SIZE      512    // Samples per buffer
+#define I2S_MIC_PORT         I2S_NUM_0
+#define I2S_SPEAKER_PORT     I2S_NUM_1
 
 // ============== GLOBAL OBJECTS ==============
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -95,7 +108,7 @@ int currentPan = 90;
 int currentTilt = 90;
 
 // LED color state
-CRGB currentColor = CRGB::Blue;
+CRGB currentColor = CRGB::White;
 uint8_t currentBrightness = LED_BRIGHTNESS;
 
 // ============== TIMING VARIABLES ==============
@@ -116,6 +129,15 @@ char udpBuffer[256];
 IPAddress brainIP;
 bool brainConnected = false;
 
+// ============== AUDIO STREAMING ==============
+WiFiUDP audioOutUdp;  // Send mic audio to laptop
+WiFiUDP audioInUdp;   // Receive speaker audio from laptop
+bool audioStreamingActive = false;
+TaskHandle_t micTaskHandle = NULL;
+TaskHandle_t speakerTaskHandle = NULL;
+int16_t micBuffer[I2S_BUFFER_SIZE];
+int16_t speakerBuffer[I2S_BUFFER_SIZE];
+
 // ============== FUNCTION PROTOTYPES ==============
 void setupWiFi();
 void setupOTA();
@@ -127,6 +149,12 @@ void handleTouch();
 void handleUDP();
 void sendStatus(const char* status);
 void drawFace();
+void playTone(int freq, int duration_ms);
+void setupI2S();
+void startAudioStreaming();
+void stopAudioStreaming();
+void micStreamTask(void* param);
+void speakerPlaybackTask(void* param);
 void drawEyes(bool open);
 void drawMouth(int state);
 void showIP();
@@ -174,7 +202,7 @@ void setup() {
     // Initialize FastLED (GPIO 5 via HW-222 booster)
     FastLED.addLeds<WS2812, PIN_LED_DATA, GRB>(leds, NUM_LEDS);
     FastLED.setBrightness(LED_BRIGHTNESS);
-    fill_solid(leds, NUM_LEDS, CRGB::Yellow);  // Boot color
+    fill_solid(leds, NUM_LEDS, CRGB::White);  // Boot color
     FastLED.show();
     Serial.println("✓ LEDs ready");
 
@@ -182,6 +210,21 @@ void setup() {
     analogReadResolution(12);
     pinMode(PIN_MIC_ADC, INPUT);
     Serial.println("✓ Mic ready");
+
+    // Initialize amplifier mute control (keep muted by default)
+    pinMode(PIN_AMP_EN, OUTPUT);
+    digitalWrite(PIN_AMP_EN, LOW);
+    Serial.println("✓ Amp muted (PIN_AMP_EN)");
+
+    // Initialize tone output (LEDC PWM) - pin should be routed to amp input via coupling
+    pinMode(PIN_TONE, OUTPUT);
+    ledcSetup(TONE_LEDC_CHANNEL, 2000, 8); // initial 2kHz, 8-bit
+    ledcAttachPin(PIN_TONE, TONE_LEDC_CHANNEL);
+    ledcWriteTone(TONE_LEDC_CHANNEL, 0); // silence
+    Serial.println("✓ Tone output initialized (PIN_TONE)");
+
+    // NOTE: I2S audio will be initialized when AUDIO_START command is received
+    // This prevents noise during boot and when audio is not in use
 
     // Setup WiFi with captive portal
     setupWiFi();
@@ -199,7 +242,7 @@ void setup() {
     
     // Initial state
     currentFace = FACE_SLEEP;
-    currentColor = CRGB::Blue;
+    currentColor = CRGB::White;
     drawFace();
     
     Serial.println("\n✓ Lumina Ready!");
@@ -401,6 +444,10 @@ void handleTouch() {
             currentColor = CRGB::Green;
             currentFace = FACE_LISTENING;
             sendStatus("STATUS:LISTENING");
+
+            // Enable amplifier for listening/speaking
+            digitalWrite(PIN_AMP_EN, HIGH);
+            Serial.println("✓ Amp enabled");
             
             // Visual feedback
             fill_solid(leds, NUM_LEDS, CRGB::Green);
@@ -411,12 +458,16 @@ void handleTouch() {
             currentColor = CRGB::Red;
             currentFace = FACE_SLEEP;
             sendStatus("STATUS:MUTE");
+
+            // Mute amplifier when chat stops
+            digitalWrite(PIN_AMP_EN, LOW);
+            Serial.println("✓ Amp muted");
             
             // Visual feedback
             fill_solid(leds, NUM_LEDS, CRGB::Red);
             FastLED.show();
             delay(200);
-            currentColor = CRGB::Blue;
+            currentColor = CRGB::White;
             drawFace();
         }
     }
@@ -486,6 +537,9 @@ void parseCommand(String cmd) {
     if (cmd == "F_TALK_START") {
         isTalking = true;
         currentFace = FACE_TALKING;
+        // Ensure amplifier is enabled when speaking
+        digitalWrite(PIN_AMP_EN, HIGH);
+        Serial.println("✓ Amp enabled (F_TALK_START)");
         drawFace();
         return;
     }
@@ -494,6 +548,11 @@ void parseCommand(String cmd) {
         isTalking = false;
         mouthState = 0;
         currentFace = FACE_HAPPY;
+        // Mute amp if chat mode is not active
+        if (!chatMode) {
+            digitalWrite(PIN_AMP_EN, LOW);
+            Serial.println("✓ Amp muted (F_TALK_STOP)");
+        }
         drawFace();
         return;
     }
@@ -510,7 +569,10 @@ void parseCommand(String cmd) {
         isLocked = false;
         isTalking = false;
         chatMode = false;
-        currentColor = CRGB::Blue;
+        currentColor = CRGB::White;
+        // Mute amplifier when going to sleep
+        digitalWrite(PIN_AMP_EN, LOW);
+        Serial.println("✓ Amp muted (F_SLEEP)");
         drawFace();
         return;
     }
@@ -581,6 +643,8 @@ void parseCommand(String cmd) {
         
         fill_solid(leds, NUM_LEDS, currentColor);
         FastLED.show();
+        Serial.printf("LED: COLOR R=%d G=%d B=%d\n", currentColor.r, currentColor.g, currentColor.b);
+        Serial.printf("LED: BRIGHTNESS=%d\n", currentBrightness);
         return;
     }
     
@@ -589,6 +653,9 @@ void parseCommand(String cmd) {
         chatMode = true;
         currentColor = CRGB::Green;
         currentFace = FACE_LISTENING;
+        // Enable amp for remote chat start
+        digitalWrite(PIN_AMP_EN, HIGH);
+        Serial.println("✓ Amp enabled (CHAT_START)");
         drawFace();
         sendStatus("STATUS:LISTENING");
         return;
@@ -597,10 +664,100 @@ void parseCommand(String cmd) {
     if (cmd == "CHAT_STOP") {
         chatMode = false;
         isTalking = false;
-        currentColor = CRGB::Blue;
+        currentColor = CRGB::White;
         currentFace = FACE_SLEEP;
+        // Mute amp for remote chat stop
+        digitalWrite(PIN_AMP_EN, LOW);
+        Serial.println("✓ Amp muted (CHAT_STOP)");
         drawFace();
         sendStatus("STATUS:MUTE");
+        return;
+    }
+
+    // Tone command: TONE or TONE:<freq>,<duration_ms>
+    if (cmd.startsWith("TONE")) {
+        int freq = 1500; // default 1.5 kHz
+        int dur = 300;   // default 300 ms
+        if (cmd.indexOf(":") >= 0) {
+            String params = cmd.substring(cmd.indexOf(":") + 1);
+            int comma = params.indexOf(",");
+            if (comma > 0) {
+                freq = params.substring(0, comma).toInt();
+                dur = params.substring(comma + 1).toInt();
+            } else {
+                freq = params.toInt();
+            }
+        }
+        playTone(freq, dur);
+        return;
+    }
+
+    // Quick hardware-driven sound test (toggle PIN_TONE manually)
+    // Usage: SOUND_TEST[:freq,ms]  freq used only to compute toggle timing (approx)
+    if (cmd.startsWith("SOUND_TEST")) {
+        int freq = 1000; int dur = 300;
+        if (cmd.indexOf(":") >= 0) {
+            String params = cmd.substring(cmd.indexOf(":") + 1);
+            int comma = params.indexOf(",");
+            if (comma > 0) {
+                freq = params.substring(0, comma).toInt();
+                dur = params.substring(comma + 1).toInt();
+            } else {
+                freq = params.toInt();
+            }
+        }
+        Serial.printf("SOUND_TEST: freq=%d dur=%d\n", freq, dur);
+        // enable amp
+        digitalWrite(PIN_AMP_EN, HIGH);
+        int half_us = max(200, 500000 / max(1, freq) ); // approximate
+        unsigned long end = millis() + dur;
+        while (millis() < end) {
+            digitalWrite(PIN_TONE, HIGH);
+            delayMicroseconds(half_us);
+            digitalWrite(PIN_TONE, LOW);
+            delayMicroseconds(half_us);
+        }
+        digitalWrite(PIN_TONE, LOW);
+        // restore amp
+        digitalWrite(PIN_AMP_EN, LOW);
+        Serial.println("SOUND_TEST: done");
+        return;
+    }
+
+    // Diagnostics commands
+    if (cmd == "MIC_TEST") {
+        // Read analog mic multiple times and print average
+        long sum = 0;
+        const int samples = 32;
+        for (int i = 0; i < samples; i++) {
+            sum += analogRead(PIN_MIC_ADC);
+            delay(5);
+        }
+        int avg = sum / samples;
+        Serial.printf("MIC_ADC: %d (avg of %d samples)\n", avg, samples);
+        return;
+    }
+
+    if (cmd == "AMP_STATUS") {
+        int state = digitalRead(PIN_AMP_EN);
+        if (state) {
+            Serial.println("AMP:ENABLED");
+        } else {
+            Serial.println("AMP:MUTED");
+        }
+        return;
+    }
+    
+    // Audio streaming control
+    if (cmd == "AUDIO_START") {
+        startAudioStreaming();
+        sendStatus("AUDIO:STREAMING");
+        return;
+    }
+    
+    if (cmd == "AUDIO_STOP") {
+        stopAudioStreaming();
+        sendStatus("AUDIO:STOPPED");
         return;
     }
 }
@@ -651,6 +808,14 @@ void showIP() {
 // ============== FACE DRAWING ==============
 void drawFace() {
     display.clearDisplay();
+    // Log current face for diagnostics
+    const char* faceNames[] = {"SLEEP","HAPPY","TALKING","LISTENING","SAD","LOVE"};
+    int faceIndex = (int)currentFace - (int)FACE_SLEEP; // enum order matches array
+    if (faceIndex >= 0 && faceIndex < 6) {
+        Serial.printf("FACE: %s\n", faceNames[faceIndex]);
+    } else {
+        Serial.println("FACE: UNKNOWN");
+    }
     
     switch (currentFace) {
         case FACE_SLEEP:
@@ -760,7 +925,7 @@ void drawEyes(bool open) {
 void drawMouth(int state) {
     int mouthY = 48;
     int mouthX = 64;
-    
+
     switch (state) {
         case 0:  // Smile
             for (int i = -15; i <= 15; i++) {
@@ -769,15 +934,264 @@ void drawMouth(int state) {
                 display.drawPixel(mouthX + i, y + 1, SSD1306_WHITE);
             }
             break;
-            
+
         case 1:  // Open O
             display.fillCircle(mouthX, mouthY, 8, SSD1306_WHITE);
             display.fillCircle(mouthX, mouthY, 4, SSD1306_BLACK);
             break;
-            
+
         case 2:  // Wide open
             display.fillRoundRect(mouthX - 12, mouthY - 6, 24, 12, 4, SSD1306_WHITE);
             display.fillRoundRect(mouthX - 8, mouthY - 3, 16, 6, 2, SSD1306_BLACK);
             break;
     }
+}
+
+// Play a simple tone using LEDC PWM. Connect PIN_TONE to amp input (via coupling cap) or speaker driver.
+void playTone(int freq, int duration_ms) {
+    if (freq <= 0 || duration_ms <= 0) return;
+
+    // Ensure amp is enabled while tone plays
+    bool wasChat = chatMode;
+    digitalWrite(PIN_AMP_EN, HIGH);
+    Serial.printf("TONE: start freq=%d dur=%dms\n", freq, duration_ms);
+
+    // Use ledcWriteTone (ESP32 helper) and set moderate duty to ensure audible level
+    ledcWriteTone(TONE_LEDC_CHANNEL, freq);
+    ledcWrite(TONE_LEDC_CHANNEL, 128); // 50% duty (8-bit)
+    Serial.printf("TONE: PWM duty set=128\n");
+    delay(duration_ms);
+    // Stop tone
+    ledcWriteTone(TONE_LEDC_CHANNEL, 0);
+    ledcWrite(TONE_LEDC_CHANNEL, 0);
+
+    // Restore amp state
+    if (!wasChat) {
+        digitalWrite(PIN_AMP_EN, LOW);
+    }
+    Serial.println("TONE: stop");
+}
+
+// ============== I2S AUDIO SETUP ==============
+void setupI2S() {
+    // Configure I2S for microphone input (INMP441 or similar)
+    i2s_config_t i2s_mic_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = I2S_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = I2S_BUFFER_SIZE,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+    
+    i2s_pin_config_t pin_mic_config = {
+        .bck_io_num = PIN_I2S_BCLK,
+        .ws_io_num = PIN_I2S_LRC,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = PIN_I2S_DIN
+    };
+    
+    if (i2s_driver_install(I2S_MIC_PORT, &i2s_mic_config, 0, NULL) != ESP_OK) {
+        Serial.println("✗ I2S mic driver install failed!");
+        return;
+    }
+    
+    if (i2s_set_pin(I2S_MIC_PORT, &pin_mic_config) != ESP_OK) {
+        Serial.println("✗ I2S mic pin config failed!");
+        return;
+    }
+    
+    // Clear I2S buffers to prevent initial noise
+    i2s_zero_dma_buffer(I2S_MIC_PORT);
+    
+    Serial.println("✓ I2S microphone ready");
+    
+    // Configure I2S for speaker output (MAX98357A or similar I2S DAC/amp)
+    i2s_config_t i2s_speaker_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = I2S_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = I2S_BUFFER_SIZE,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+    
+    // Note: For I2S speaker, you may need different pins (e.g., GPIO32/33/15 for second I2S)
+    // or use the same I2S port in TX mode (not simultaneous RX/TX)
+    // For now, we'll use I2S_NUM_1 with separate pins (adjust as needed for your hardware)
+    i2s_pin_config_t pin_speaker_config = {
+        .bck_io_num = 32,     // BCLK for speaker (adjust to your wiring)
+        .ws_io_num = 33,      // LRC for speaker (adjust to your wiring)  
+        .data_out_num = 15,   // DOUT for speaker - CHANGED from 25 to avoid conflict
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+    
+    if (i2s_driver_install(I2S_SPEAKER_PORT, &i2s_speaker_config, 0, NULL) != ESP_OK) {
+        Serial.println("✗ I2S speaker driver install failed!");
+        return;
+    }
+    
+    if (i2s_set_pin(I2S_SPEAKER_PORT, &pin_speaker_config) != ESP_OK) {
+        Serial.println("✗ I2S speaker pin config failed!");
+        return;
+    }
+    
+    // Clear I2S buffers to prevent initial noise
+    i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
+    
+    Serial.println("✓ I2S speaker ready");
+}
+
+// ============== AUDIO STREAMING CONTROL ==============
+void startAudioStreaming() {
+    if (audioStreamingActive) {
+        Serial.println("Audio streaming already active");
+        return;
+    }
+    
+    if (!brainConnected) {
+        Serial.println("Cannot start audio: Brain not connected");
+        return;
+    }
+    
+    // Initialize I2S now (not on boot) to prevent noise
+    Serial.println("Initializing I2S for audio streaming...");
+    setupI2S();
+    
+    audioStreamingActive = true;
+    
+    // Create microphone streaming task
+    xTaskCreatePinnedToCore(
+        micStreamTask,
+        "MicStream",
+        4096,
+        NULL,
+        1,
+        &micTaskHandle,
+        0
+    );
+    
+    // Create speaker playback task
+    xTaskCreatePinnedToCore(
+        speakerPlaybackTask,
+        "SpeakerPlay",
+        4096,
+        NULL,
+        1,
+        &speakerTaskHandle,
+        0
+    );
+    
+    Serial.println("✓ Audio streaming started");
+}
+
+void stopAudioStreaming() {
+    if (!audioStreamingActive) return;
+    
+    audioStreamingActive = false;
+    
+    // Delete tasks
+    if (micTaskHandle != NULL) {
+        vTaskDelete(micTaskHandle);
+        micTaskHandle = NULL;
+    }
+    
+    if (speakerTaskHandle != NULL) {
+        vTaskDelete(speakerTaskHandle);
+        speakerTaskHandle = NULL;
+    }
+    
+    // Deinitialize I2S to stop any noise
+    Serial.println("Deinitializing I2S drivers...");
+    i2s_driver_uninstall(I2S_MIC_PORT);
+    i2s_driver_uninstall(I2S_SPEAKER_PORT);
+    
+    // Ensure amp is muted
+    digitalWrite(PIN_AMP_EN, LOW);
+    
+    Serial.println("✓ Audio streaming stopped");
+}
+
+// ============== AUDIO STREAMING TASKS ==============
+void micStreamTask(void* param) {
+    size_t bytes_read = 0;
+    
+    Serial.println("Mic streaming task started");
+    
+    while (audioStreamingActive) {
+        // Read from I2S microphone
+        i2s_read(I2S_MIC_PORT, micBuffer, I2S_BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
+        
+        if (bytes_read > 0 && brainConnected) {
+            // Send audio data to laptop via UDP
+            audioOutUdp.beginPacket(brainIP, UDP_AUDIO_OUT_PORT);
+            audioOutUdp.write((uint8_t*)micBuffer, bytes_read);
+            audioOutUdp.endPacket();
+        }
+        
+        // Small yield to prevent watchdog timeout
+        vTaskDelay(1);
+    }
+    
+    Serial.println("Mic streaming task ended");
+    vTaskDelete(NULL);
+}
+
+void speakerPlaybackTask(void* param) {
+    size_t bytes_written = 0;
+    
+    Serial.println("Speaker playback task started");
+    
+    // Initialize speaker buffer with silence
+    memset(speakerBuffer, 0, sizeof(speakerBuffer));
+    
+    // Keep amp MUTED initially - will enable when we receive first real audio packet
+    digitalWrite(PIN_AMP_EN, LOW);
+    
+    // Start listening for audio packets from laptop
+    audioInUdp.begin(UDP_AUDIO_IN_PORT);
+    
+    bool firstPacketReceived = false;
+    
+    while (audioStreamingActive) {
+        int packetSize = audioInUdp.parsePacket();
+        
+        if (packetSize > 0) {
+            // Read UDP packet into speaker buffer
+            int bytesRead = audioInUdp.read((uint8_t*)speakerBuffer, min(packetSize, (int)(I2S_BUFFER_SIZE * sizeof(int16_t))));
+            
+            if (bytesRead > 0) {
+                // Enable amp on first real audio packet
+                if (!firstPacketReceived) {
+                    digitalWrite(PIN_AMP_EN, HIGH);
+                    firstPacketReceived = true;
+                    Serial.println("✓ First audio received, amp enabled");
+                }
+                
+                // Write to I2S speaker
+                i2s_write(I2S_SPEAKER_PORT, speakerBuffer, bytesRead, &bytes_written, portMAX_DELAY);
+            }
+        }
+        
+        // Small yield
+        vTaskDelay(1);
+    }
+    
+    // Mute amplifier when done (unless in chat mode)
+    if (!chatMode) {
+        digitalWrite(PIN_AMP_EN, LOW);
+    }
+    
+    Serial.println("Speaker playback task ended");
+    vTaskDelete(NULL);
 }
