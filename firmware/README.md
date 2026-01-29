@@ -1,171 +1,67 @@
-# Lumina Pro Firmware - "The Split Nervous System"
+# Lumina Body Firmware
 
-ESP32 DevKit V1 firmware for the Lumina interactive robotic lamp.
+ESP32 firmware that controls the lamp's motors, display, and LEDs.
 
-## Architecture Overview
+## What's in here
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    "The Split Nervous System"                 │
-├───────────────────────────────────────────────────────────────┤
-│                                                               │
-│  Device A (Body)          Device B (Eyes)    Device C (Brain) │
-│  ESP32 DevKit V1          ESP32-CAM           Laptop (Python) │
-│  ┌──────────────┐         ┌──────────┐        ┌────────────┐  │
-│  │ Motors       │         │ Camera   │        │ Vision AI  │  │
-│  │ LED Lamp     │◄──UDP───│ Streamer │──HTTP─►│ Voice AI   │  │
-│  │ OLED Display │         └──────────┘        │ Gemini API │  │
-│  │ Touch Sensor │◄────────UDP Commands───────►│            │  │
-│  │ Audio I/O    │                             └────────────┘  │
-│  └──────────────┘                                             │
-└───────────────────────────────────────────────────────────────┘
-```
+This is the code running on the ESP32 DevKit that makes the lamp move and show expressions. It talks to the Python app over WiFi (UDP).
 
-## Hardware Requirements (Device A - Body)
+## Wiring
 
-- **ESP32 DevKit V1**
-- **SSD1306 OLED Display** (128x64, I2C) - Shows faces/status
-- **2x SG90 Servo Motors** (Pan/Tilt)
-- **WS2812 LED Stick** - Main lamp via HW-222 signal booster
-- **TTP223 Touch Sensor** - Toggle chat mode
-- **MAX4466 Microphone** - Audio input (analog)
-- **MAX98357A I2S Amplifier** - Audio output
+| Component | ESP32 Pin |
+|-----------|-----------|
+| Pan Servo | GPIO 18 |
+| Tilt Servo | GPIO 19 |
+| OLED SDA | GPIO 21 |
+| OLED SCL | GPIO 22 |
+| LED Ring | GPIO 5 |
+| Touch | GPIO 4 |
+| I2S LRC | GPIO 25 |
+| I2S BCLK | GPIO 26 |
+| I2S DIN | GPIO 27 |
 
-## Pinout
+## First time setup
 
-| Component        | ESP32 Pin | Notes                    |
-|------------------|-----------|--------------------------|
-| **Pan Servo**    | GPIO 18   |                          |
-| **Tilt Servo**   | GPIO 19   |                          |
-| **OLED SDA**     | GPIO 21   | I2C Data                 |
-| **OLED SCL**     | GPIO 22   | I2C Clock                |
-| **WS2812 LED**   | GPIO 5    | Via HW-222 level shifter |
-| **Touch Sensor** | GPIO 4    | TTP223                   |
-| **I2S LRC**      | GPIO 25   | MAX98357A                |
-| **I2S BCLK**     | GPIO 26   | MAX98357A                |
-| **I2S DIN**      | GPIO 27   | MAX98357A                |
-| **Mic ADC**      | GPIO 34   | MAX4466 analog out       |
-
-## LED Wiring (3-Wire Config with HW-222)
-
-```
-            ┌─────────────────────────────────────┐
-            │         HW-222 Signal Booster       │
-            │  ┌───────────────────────────────┐  │
-5V ─────────┼──┤ VCC                       VCC ├──┼──── WS2812 5V
-            │  │                               │  │
-GPIO 5 ─────┼──┤ IN (3.3V)         OUT (5V)    ├──┼──── WS2812 DIN
-            │  │                               │  │
-GND ────────┼──┤ GND                       GND ├──┼──── WS2812 GND
-            │  └───────────────────────────────┘  │
-            └─────────────────────────────────────┘
-```
-
-## Features
-
-### WiFiManager (No Hardcoded Credentials)
-- On first boot, creates "Lumina-Setup" access point
-- Connect to it and open 192.168.4.1 to configure WiFi
-- Credentials are saved to flash
-
-### ArduinoOTA (Wireless Updates)
-- After WiFi connection, upload wirelessly:
-  ```bash
-  pio run -t upload --upload-port lumina.local
-  ```
-
-### Touch Sensor Toggle
-- **Touch** → Toggle chat mode ON/OFF
-- **Chat ON** → LEDs Green, sends `STATUS:LISTENING` to laptop
-- **Chat OFF** → LEDs Red briefly, sends `STATUS:MUTE` to laptop
-
-### UDP Communication (Port 5005)
-- Brain discovers body via broadcast `DISCOVER`
-- Body responds with `LUMINA_BODY`
-- Commands: `P90T45`, `F_HAPPY`, `COLOR:blue`, `B50`, etc.
-
-## Setup
-
-### 1. Install PlatformIO
-
-Install the [PlatformIO extension](https://platformio.org/install/ide?install=vscode) for VS Code.
-
-### 2. Build the Project
-
-```bash
-cd firmware
-pio run
-```
-
-### 3. Upload to ESP32 (USB - First Time)
+**1. Build and upload via USB**
 
 ```bash
 pio run -t upload
 ```
 
-### 4. Configure WiFi
+**2. Configure WiFi**
 
-1. Connect to "Lumina-Setup" WiFi network
-2. Open http://192.168.4.1 in browser
-3. Select your WiFi network and enter password
-4. ESP32 will restart and connect
+After upload, the ESP32 creates a hotspot called "Lumina-Setup". Connect to it with your phone or laptop, go to 192.168.4.1, and enter your WiFi credentials.
 
-### 5. Upload via OTA (After WiFi Setup)
+**3. Upload over the air (after WiFi works)**
 
 ```bash
+pio run -t upload --upload-port <ESP32_IP>
+# or
 pio run -t upload --upload-port lumina.local
 ```
 
-### 6. Monitor Serial Output
+## Commands
 
-```bash
-pio device monitor
-```
+The Python app sends these over UDP port 5005:
 
-## Serial/UDP Commands
-
-| Command         | Description                      |
-|-----------------|----------------------------------|
-| `P90T45`        | Move pan to 90°, tilt to 45°     |
-| `F_HAPPY`       | Display happy face               |
-| `F_SLEEP`       | Display sleep face               |
-| `F_LISTENING`   | Display listening icon           |
-| `F_TALK_START`  | Start talking animation          |
-| `F_TALK_STOP`   | Stop talking animation           |
-| `B50`           | Set brightness to 50%            |
-| `L128`          | Set brightness (0-255)           |
-| `COLOR:blue`    | Set LED color by name            |
-| `C255,0,0`      | Set LED color RGB                |
-| `CHAT_START`    | Enable chat mode remotely        |
-| `CHAT_STOP`     | Disable chat mode remotely       |
-| `PING`          | Response: `PONG`                 |
-| `DISCOVER`      | Response: `LUMINA_BODY`          |
-
-## Status Messages (Body → Brain)
-
-| Status               | Meaning                     |
-|----------------------|-----------------------------|
-| `STATUS:LISTENING`   | Touch activated, ready      |
-| `STATUS:MUTE`        | Touch deactivated           |
-| `HEARTBEAT:LISTENING`| Periodic status (chat on)   |
-| `HEARTBEAT:MUTE`     | Periodic status (chat off)  |
-| `LUMINA_BODY`        | Discovery response          |
-| `PONG`               | Ping response               |
+| Command | What it does |
+|---------|--------------|
+| `P90T45` | Move pan to 90°, tilt to 45° |
+| `F_HAPPY` | Show happy face |
+| `F_SLEEP` | Show sleep face |
+| `F_TALK_START` | Start talking animation |
+| `F_TALK_STOP` | Stop talking |
+| `B50` | Set LED brightness to 50% |
+| `COLOR:blue` | Set LED color |
 
 ## Troubleshooting
 
-### WiFi Not Connecting
-- Hold reset button for 5+ seconds to clear saved WiFi
-- Or erase flash: `pio run -t erase`
+**WiFi won't connect?**
+- Erase flash and reconfigure: `pio run -t erase`
 
-### OTA Upload Fails
-- Ensure laptop is on same network as ESP32
-- Try using IP address instead: `--upload-port 192.168.x.x`
+**OTA upload fails?**
+- Make sure your laptop is on the same network
+- Try using the IP address directly instead of `lumina.local`
 
-### LEDs Not Working
-- Check HW-222 connections (5V, GND, signal direction)
-- Verify GPIO 5 is correct
-
-### Touch Not Responding
-- TTP223 needs stable 3.3V power
-- Check GPIO 4 connection
+**LEDs not working?**
+- Check that you're using a level shifter (HW-222) between 3.3V GPIO and 5V LED strip

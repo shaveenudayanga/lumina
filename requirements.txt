@@ -1,17 +1,15 @@
-# Pinned dependencies for Lumina Pro
-# Core vision and control
-opencv-python==4.8.0.76
-mediapipe==0.10.14
-pyserial==3.5
-numpy==1.26.0
-python-dotenv==1.2.1
+# Lumina dependencies
 
-# Optional: Voice AI (for lumina_master.py)
-google-genai>=0.1.0
+# Vision and control
+opencv-python>=4.8.0
+mediapipe>=0.10.14
+pyserial>=3.5
+numpy>=1.26.0
+python-dotenv>=1.0.0
+
+# Voice AI
+google-genai>=1.0.0
 SpeechRecognition>=3.10.0
-edge-tts>=6.1.0          # Natural neural voices (replaces gTTS)
+edge-tts>=6.1.0
 pygame>=2.5.0
-# Note: pyaudio removed - using ESP32 I2S audio via UDP instead
-
-# Development/Testing
-pytest>=7.4.0
+pyaudio>=0.2.14

@@ -29,6 +29,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WiFiMulti.h>
 #include <ArduinoOTA.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
@@ -37,6 +38,8 @@
 #include <ESP32Servo.h>
 #include <FastLED.h>
 #include <driver/i2s.h>
+#include "esp_adc_cal.h"  // ADC calibration helpers
+#include <time.h>         // NTP time support
 
 // ============== PIN DEFINITIONS ==============
 #define PIN_SERVO_PAN    18
@@ -58,7 +61,8 @@
 #define SCREEN_WIDTH     128
 #define SCREEN_HEIGHT    64
 #define OLED_RESET       -1
-#define OLED_ADDR        0x3C
+#define OLED_ADDR        0x3D  // First display (main status)
+#define OLED_ADDR_2      0x3C  // Second display (clock/info)
 
 #define NUM_LEDS         8    // LED stick count
 #define LED_BRIGHTNESS   80
@@ -82,17 +86,33 @@
 
 // ============== AUDIO SETTINGS ==============
 #define I2S_SAMPLE_RATE      16000  // 16kHz for voice
-#define I2S_BUFFER_SIZE      512    // Samples per buffer
+#define I2S_BUFFER_SIZE      128    // Smaller buffer = lower latency (128 samples)
 #define I2S_MIC_PORT         I2S_NUM_0
 #define I2S_SPEAKER_PORT     I2S_NUM_1
+// MAX4466 is analog mic - use ADC with I2S
+#define USE_ADC_MIC          true   // true for MAX4466, false for I2S digital mic
+#define ADC_MIC_CHANNEL      ADC1_CHANNEL_7  // GPIO35 for MAX4466
+#define DEFAULT_VREF         1100  // mV for ADC calibration
 
 // ============== GLOBAL OBJECTS ==============
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display2(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);  // Second display
 Servo panServo;
 Servo tiltServo;
 CRGB leds[NUM_LEDS];
 WiFiUDP udp;
 WiFiManager wifiManager;
+WiFiMulti wifiMulti;
+
+// ============== MULTI-NETWORK CONFIG ==============
+// Add your WiFi networks here (SSID, password)
+// The device will connect to whichever is available
+const char* networks[][2] = {
+  {"Galaxy S20 FE C565", "poiuytre"},  // Mobile hotspot
+  // {"YourHomeWiFi", "homepassword"},
+  // {"YourOfficeWiFi", "officepassword"},
+};
+const int numNetworks = sizeof(networks) / sizeof(networks[0]);
 
 // ============== STATE VARIABLES ==============
 enum FaceState { FACE_SLEEP, FACE_HAPPY, FACE_TALKING, FACE_LISTENING, FACE_SAD, FACE_LOVE };
@@ -118,11 +138,22 @@ unsigned long lastLedUpdateTime = 0;
 unsigned long lastTouchTime = 0;
 unsigned long lastStatusSendTime = 0;
 unsigned long lastUdpCheckTime = 0;
+unsigned long lastClockUpdateTime = 0;  // For clock display on OLED 2
+
+// NTP Configuration
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800;  // Sri Lanka UTC+5:30 = 5.5 * 3600
+const int daylightOffset_sec = 0;
 
 bool eyesOpen = true;
 int mouthState = 0;
 uint8_t breathPhase = 0;
 bool lastTouchState = false;
+
+// Scrolling text for idle mode
+int scrollX = 128;  // Start from right edge
+unsigned long lastScrollTime = 0;
+const char* scrollText = "Say Hi Lumina...";
 
 // ============== UDP BUFFER ==============
 char udpBuffer[256];
@@ -169,15 +200,15 @@ void setup() {
     Serial.println("=============================");
 
     // Initialize Touch Sensor
-    pinMode(PIN_TOUCH, INPUT);
+    // Touch sensor disabled: pinMode(PIN_TOUCH, INPUT);  // Disabled to avoid noisy toggles
     Serial.println("✓ Touch sensor ready");
 
     // Initialize I2C for OLED
     Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
     
-    // Initialize OLED
+    // Initialize first OLED (main status)
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        Serial.println("✗ OLED failed!");
+        Serial.println("✗ OLED 1 failed!");
         while (true) { delay(100); }
     }
     display.clearDisplay();
@@ -186,18 +217,38 @@ void setup() {
     display.setCursor(0, 0);
     display.println("Lumina Booting...");
     display.display();
-    Serial.println("✓ OLED ready");
+    Serial.println("✓ OLED 1 ready (0x3C)");
 
-    // Initialize Servos
+    // Initialize second OLED (clock/info)
+    if (!display2.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR_2)) {
+        Serial.println("✗ OLED 2 failed (check address jumper!)");
+        // Continue anyway - second display is optional
+    } else {
+        display2.clearDisplay();
+        display2.setTextColor(SSD1306_WHITE);
+        display2.setTextSize(2);
+        display2.setCursor(0, 0);
+        display2.println(" LUMINA");
+        display2.setTextSize(1);
+        display2.setCursor(0, 25);
+        display2.println("  Clock Display");
+        display2.display();
+        Serial.println("✓ OLED 2 ready (0x3D)");
+    }
+
+    // Initialize Servos - DISABLED by default, enable with SERVO_ENABLE command
+    // Allocate ALL 4 timers as recommended by ESP32Servo library
     ESP32PWM::allocateTimer(0);
     ESP32PWM::allocateTimer(1);
-    panServo.setPeriodHertz(50);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+    panServo.setPeriodHertz(50);   // Standard 50Hz for SG90
     tiltServo.setPeriodHertz(50);
-    panServo.attach(PIN_SERVO_PAN, SERVO_MIN_US, SERVO_MAX_US);
-    tiltServo.attach(PIN_SERVO_TILT, SERVO_MIN_US, SERVO_MAX_US);
-    panServo.write(90);
-    tiltServo.write(90);
-    Serial.println("✓ Servos ready");
+    // Servos NOT attached - use SERVO_ENABLE command when hardware is verified
+    // This prevents any movement until explicitly enabled
+    Serial.println("⚠ Servos DISABLED - send SERVO_ENABLE to attach");
+    Serial.println("  SERVO_VERIFY: Test with 1500µs pulse (should NOT move 180° servo)");
+    Serial.println("  SERVO_ENABLE: Attach servos and center at 90°");
 
     // Initialize FastLED (GPIO 5 via HW-222 booster)
     FastLED.addLeds<WS2812, PIN_LED_DATA, GRB>(leds, NUM_LEDS);
@@ -229,6 +280,10 @@ void setup() {
     // Setup WiFi with captive portal
     setupWiFi();
     
+    // Setup NTP time sync
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("✓ NTP time sync started");
+    
     // Setup OTA
     setupOTA();
     
@@ -236,9 +291,18 @@ void setup() {
     udp.begin(UDP_PORT);
     Serial.printf("✓ UDP listening on port %d\n", UDP_PORT);
 
+    // Show "Hi Lumina" greeting on eyes display
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(15, 25);
+    display.println("Hi Lumina");
+    display.display();
+    delay(2000);
+    
     // Show IP address on OLED
     showIP();
-    delay(3000);
+    delay(2000);
     
     // Initial state
     currentFace = FACE_SLEEP;
@@ -259,7 +323,36 @@ void setupWiFi() {
     // Set hostname
     WiFi.setHostname(HOSTNAME);
     
-    // Configure WiFiManager
+    // Try known networks first (if any configured)
+    if (numNetworks > 0) {
+        Serial.printf("Trying %d known networks...\n", numNetworks);
+        for (int i = 0; i < numNetworks; i++) {
+            wifiMulti.addAP(networks[i][0], networks[i][1]);
+            Serial.printf("  - %s\n", networks[i][0]);
+        }
+        
+        if (wifiMulti.run(10000) == WL_CONNECTED) {
+            display.clearDisplay();
+            display.setCursor(0, 0);
+            display.println("✓ WiFi Connected!");
+            display.println();
+            display.print("SSID: ");
+            display.println(WiFi.SSID());
+            display.print("IP: ");
+            display.println(WiFi.localIP());
+            display.display();
+            
+            Serial.println("✓ Connected to known network!");
+            Serial.print("  SSID: ");
+            Serial.println(WiFi.SSID());
+            Serial.print("  IP: ");
+            Serial.println(WiFi.localIP());
+            return;
+        }
+        Serial.println("No known networks found, starting setup portal...");
+    }
+    
+    // Fall back to WiFiManager config portal
     wifiManager.setConfigPortalTimeout(180);  // 3 minute timeout
     wifiManager.setAPCallback([](WiFiManager* wm) {
         display.clearDisplay();
@@ -386,6 +479,16 @@ void loop() {
     // Servo Smoothing
     updateServos();
     
+    // Scrolling text animation for idle mode
+    if (currentFace == FACE_SLEEP && currentMillis - lastScrollTime >= 50) {
+        lastScrollTime = currentMillis;
+        scrollX -= 2;  // Move 2 pixels left
+        if (scrollX < -160) {
+            scrollX = 128;
+        }
+        drawFace();
+    }
+    
     // Face Animation
     if (isTalking) {
         if (currentMillis - lastTalkAnimTime >= TALK_ANIM_INTERVAL) {
@@ -413,6 +516,32 @@ void loop() {
         updateLeds();
     }
     
+    // Update clock on display2 every second
+    if (currentMillis - lastClockUpdateTime >= 1000) {
+        lastClockUpdateTime = currentMillis;
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            display2.clearDisplay();
+            display2.setTextColor(SSD1306_WHITE);
+            
+            // Time in large text (hours:minutes only)
+            display2.setTextSize(3);
+            char timeStr[9];
+            strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+            display2.setCursor(20, 10);
+            display2.println(timeStr);
+            
+            // Date
+            display2.setTextSize(1);
+            char dateStr[20];
+            strftime(dateStr, sizeof(dateStr), "%a %d %b %Y", &timeinfo);
+            display2.setCursor(15, 45);
+            display2.println(dateStr);
+            
+            display2.display();
+        }
+    }
+    
     // Periodic status send to brain
     if (brainConnected && currentMillis - lastStatusSendTime >= STATUS_SEND_INTERVAL) {
         lastStatusSendTime = currentMillis;
@@ -427,52 +556,11 @@ void loop() {
 
 // ============== TOUCH HANDLER ==============
 void handleTouch() {
-    bool touchState = digitalRead(PIN_TOUCH) == HIGH;
-    unsigned long now = millis();
-    
-    // Debounced toggle on rising edge
-    if (touchState && !lastTouchState && (now - lastTouchTime > TOUCH_DEBOUNCE)) {
-        lastTouchTime = now;
-        
-        // Toggle chat mode
-        chatMode = !chatMode;
-        
-        Serial.printf("Touch! Chat mode: %s\n", chatMode ? "ON" : "OFF");
-        
-        if (chatMode) {
-            // Start listening mode
-            currentColor = CRGB::Green;
-            currentFace = FACE_LISTENING;
-            sendStatus("STATUS:LISTENING");
-
-            // Enable amplifier for listening/speaking
-            digitalWrite(PIN_AMP_EN, HIGH);
-            Serial.println("✓ Amp enabled");
-            
-            // Visual feedback
-            fill_solid(leds, NUM_LEDS, CRGB::Green);
-            FastLED.show();
-            drawFace();
-        } else {
-            // Stop listening mode
-            currentColor = CRGB::Red;
-            currentFace = FACE_SLEEP;
-            sendStatus("STATUS:MUTE");
-
-            // Mute amplifier when chat stops
-            digitalWrite(PIN_AMP_EN, LOW);
-            Serial.println("✓ Amp muted");
-            
-            // Visual feedback
-            fill_solid(leds, NUM_LEDS, CRGB::Red);
-            FastLED.show();
-            delay(200);
-            currentColor = CRGB::White;
-            drawFace();
-        }
-    }
-    
-    lastTouchState = touchState;
+    // Touch feature is fully disabled to prevent noisy toggles.
+    // Retain function for compatibility but do nothing here.
+    (void)lastTouchState; // silence unused variable warnings
+    (void)lastTouchTime;
+    return;
 }
 
 // ============== UDP HANDLER ==============
@@ -521,15 +609,67 @@ void parseCommand(String cmd) {
         sendStatus("PONG");
         return;
     }
+    
+    // WiFi reset command - clears saved credentials and restarts
+    if (cmd == "WIFI_RESET") {
+        Serial.println("⚠️ WiFi reset requested!");
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("WiFi Reset!");
+        display.println("Clearing...");
+        display.display();
+        
+        wifiManager.resetSettings();
+        Serial.println("✓ WiFi settings cleared");
+        Serial.println("Restarting in 2 seconds...");
+        
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("WiFi Cleared!");
+        display.println("Restarting...");
+        display.display();
+        
+        delay(2000);
+        ESP.restart();
+        return;
+    }
+
+    // TEXT command: Display text on eyes (display 1)
+    // TEXT:Hello World
+    if (cmd.startsWith("TEXT:")) {
+        String text = cmd.substring(5);
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(5, 25);
+        display.println(text);
+        display.display();
+        Serial.printf("✓ Display text: %s\n", text.c_str());
+        return;
+    }
 
     // Pan/Tilt command: P90T45
     if (cmd.startsWith("P") && cmd.indexOf("T") > 0) {
         int tIndex = cmd.indexOf("T");
         targetPan = cmd.substring(1, tIndex).toInt();
         targetTilt = cmd.substring(tIndex + 1).toInt();
-        targetPan = constrain(targetPan, 0, 180);
-        targetTilt = constrain(targetTilt, 45, 135);
+        // Constrain to safe range: Pan ±60° from center (30-150°), Tilt 30-150°
+        targetPan = constrain(targetPan, 30, 150);
+        targetTilt = constrain(targetTilt, 30, 150);
         isLocked = true;
+        return;
+    }
+    
+    // Reset position command: RESET_POS - sets current position to center without moving
+    if (cmd == "RESET_POS") {
+        // Set firmware's understanding of position to 90° (center) without physically moving servos
+        // Use this after manually positioning the lamp to center/front
+        currentPan = 90;
+        currentTilt = 90;
+        targetPan = 90;
+        targetTilt = 90;
+        Serial.println("✓ Position reset to center (90°, 90°)");
+        Serial.println("  Servos NOT moved - firmware now assumes lamp is centered");
         return;
     }
 
@@ -760,21 +900,321 @@ void parseCommand(String cmd) {
         sendStatus("AUDIO:STOPPED");
         return;
     }
+    
+    // ============== 360° CONTINUOUS ROTATION SERVO COMMANDS ==============
+    // These servos spin continuously - speed/direction controlled by pulse width:
+    //   ~1500µs = STOP (may need calibration)
+    //   < neutral = spin clockwise (slower near neutral, faster near 1000)
+    //   > neutral = spin counter-clockwise (slower near neutral, faster near 2000)
+    
+    // Movement duration in milliseconds (how long to spin)
+    static int moveDuration = 100;  // Default 100ms pulse
+    // Speed offset from neutral (higher = faster spin)
+    static int moveSpeed = 50;      // Default: neutral±50 = slow speed
+    // Neutral point - this is where the servo STOPS (needs calibration!)
+    static int neutralPan = 1500;   // Default 1500µs
+    static int neutralTilt = 1500;  // Default 1500µs
+    
+    // Current position tracking for smooth movement
+    static int currentPanAngle = 90;
+    static int currentTiltAngle = 90;
+    static int servoStepDelay = 20;  // Delay between steps in ms (20ms = 4x slower than default ~5ms)
+    
+    // SERVO_CAL:XXXX - Calibrate neutral point (try values from 1400-1600)
+    // Usage: SERVO_CAL:1480 or SERVO_CAL:1520 to find where servos stop
+    if (cmd.startsWith("SERVO_CAL:")) {
+        int newNeutral = cmd.substring(10).toInt();
+        if (newNeutral >= 1400 && newNeutral <= 1600) {
+            neutralPan = newNeutral;
+            neutralTilt = newNeutral;
+            // Apply immediately
+            if (panServo.attached()) {
+                panServo.writeMicroseconds(neutralPan);
+                tiltServo.writeMicroseconds(neutralTilt);
+            }
+            Serial.printf("✓ Neutral set to %dµs - both servos updated\n", newNeutral);
+            Serial.println("If still spinning, try higher or lower values");
+        } else {
+            Serial.println("Invalid value. Use 1400-1600 (default: 1500)");
+        }
+        return;
+    }
+    
+    // SERVO_CAL_PAN:XXXX - Calibrate pan servo only
+    if (cmd.startsWith("SERVO_CAL_PAN:")) {
+        int newNeutral = cmd.substring(14).toInt();
+        if (newNeutral >= 1400 && newNeutral <= 1600) {
+            neutralPan = newNeutral;
+            if (panServo.attached()) {
+                panServo.writeMicroseconds(neutralPan);
+            }
+            Serial.printf("✓ Pan neutral set to %dµs\n", newNeutral);
+        }
+        return;
+    }
+    
+    // SERVO_CAL_TILT:XXXX - Calibrate tilt servo only
+    if (cmd.startsWith("SERVO_CAL_TILT:")) {
+        int newNeutral = cmd.substring(15).toInt();
+        if (newNeutral >= 1400 && newNeutral <= 1600) {
+            neutralTilt = newNeutral;
+            if (tiltServo.attached()) {
+                tiltServo.writeMicroseconds(neutralTilt);
+            }
+            Serial.printf("✓ Tilt neutral set to %dµs\n", newNeutral);
+        }
+        return;
+    }
+    
+    // SERVO_ENABLE: Attach servos at center position
+    if (cmd == "SERVO_ENABLE") {
+        Serial.println("Enabling servos...");
+        panServo.attach(PIN_SERVO_PAN, SERVO_MIN_US, SERVO_MAX_US);
+        tiltServo.attach(PIN_SERVO_TILT, SERVO_MIN_US, SERVO_MAX_US);
+        panServo.write(90);  // Center position for 180° servos
+        tiltServo.write(90); // Center position for 180° servos
+        currentPanAngle = 90;   // Update position tracking
+        currentTiltAngle = 90;  // Update position tracking
+        Serial.println("✓ Servos ENABLED at center (90°)");
+        return;
+    }
+    
+    // SERVO_DISABLE: Detach servos completely
+    if (cmd == "SERVO_DISABLE") {
+        panServo.writeMicroseconds(neutralPan);  // Stop first
+        tiltServo.writeMicroseconds(neutralTilt);
+        delay(50);
+        panServo.detach();
+        tiltServo.detach();
+        Serial.println("✓ Servos STOPPED and DETACHED");
+        return;
+    }
+    
+    // SERVO_STOP: Immediately stop all movement
+    if (cmd == "SERVO_STOP" || cmd == "STOP") {
+        panServo.writeMicroseconds(neutralPan);
+        tiltServo.writeMicroseconds(neutralTilt);
+        Serial.printf("STOP: Servos at neutral (Pan: %dµs, Tilt: %dµs)\n", neutralPan, neutralTilt);
+        return;
+    }
+    
+    // SERVO_SPEED:XX - Set movement speed (10-200, higher = faster)
+    if (cmd.startsWith("SERVO_SPEED:")) {
+        int newSpeed = cmd.substring(12).toInt();
+        if (newSpeed >= 10 && newSpeed <= 200) {
+            moveSpeed = newSpeed;
+            Serial.printf("Speed set to %d (pulse: 1500±%dµs)\n", moveSpeed, moveSpeed);
+        } else {
+            Serial.println("Invalid speed. Use 10-200 (default: 50)");
+        }
+        return;
+    }
+    
+    // SERVO_DURATION:XX - Set movement duration in ms (50-1000)
+    if (cmd.startsWith("SERVO_DURATION:")) {
+        int newDuration = cmd.substring(15).toInt();
+        if (newDuration >= 50 && newDuration <= 1000) {
+            moveDuration = newDuration;
+            Serial.printf("Duration set to %dms\n", moveDuration);
+        } else {
+            Serial.println("Invalid duration. Use 50-1000ms (default: 100)");
+        }
+        return;
+    }
+    
+    // PAN_LEFT: Spin pan servo one direction for moveDuration
+    if (cmd == "PAN_LEFT") {
+        if (!panServo.attached()) {
+            Serial.println("Servos not attached! Use SERVO_ENABLE first");
+            return;
+        }
+        Serial.printf("Pan LEFT: %dµs for %dms\n", neutralPan + moveSpeed, moveDuration);
+        panServo.writeMicroseconds(neutralPan + moveSpeed);  // Spin CCW
+        delay(moveDuration);
+        panServo.writeMicroseconds(neutralPan);  // Stop
+        Serial.println("Pan stopped");
+        return;
+    }
+    
+    // PAN_RIGHT: Spin pan servo other direction for moveDuration
+    if (cmd == "PAN_RIGHT") {
+        if (!panServo.attached()) {
+            Serial.println("Servos not attached! Use SERVO_ENABLE first");
+            return;
+        }
+        Serial.printf("Pan RIGHT: %dµs for %dms\n", neutralPan - moveSpeed, moveDuration);
+        panServo.writeMicroseconds(neutralPan - moveSpeed);  // Spin CW
+        delay(moveDuration);
+        panServo.writeMicroseconds(neutralPan);  // Stop
+        Serial.println("Pan stopped");
+        return;
+    }
+    
+    // TILT_UP: Spin tilt servo one direction for moveDuration
+    if (cmd == "TILT_UP") {
+        if (!tiltServo.attached()) {
+            Serial.println("Servos not attached! Use SERVO_ENABLE first");
+            return;
+        }
+        Serial.printf("Tilt UP: %dµs for %dms\n", neutralTilt + moveSpeed, moveDuration);
+        tiltServo.writeMicroseconds(neutralTilt + moveSpeed);  // Spin CCW
+        delay(moveDuration);
+        tiltServo.writeMicroseconds(neutralTilt);  // Stop
+        Serial.println("Tilt stopped");
+        return;
+    }
+    
+    // TILT_DOWN: Spin tilt servo other direction for moveDuration
+    if (cmd == "TILT_DOWN") {
+        if (!tiltServo.attached()) {
+            Serial.println("Servos not attached! Use SERVO_ENABLE first");
+            return;
+        }
+        Serial.printf("Tilt DOWN: %dµs for %dms\n", neutralTilt - moveSpeed, moveDuration);
+        tiltServo.writeMicroseconds(neutralTilt - moveSpeed);  // Spin CW
+        delay(moveDuration);
+        tiltServo.writeMicroseconds(neutralTilt);  // Stop
+        Serial.println("Tilt stopped");
+        return;
+    }
+    
+    // SERVO_TEST: Brief test of all directions
+    if (cmd == "SERVO_TEST") {
+        if (!panServo.attached()) {
+            Serial.println("Servos not attached! Use SERVO_ENABLE first");
+            return;
+        }
+        Serial.println("=== 360° SERVO TEST ===");
+        Serial.printf("Speed: %d, Duration: %dms, Neutral Pan: %d, Tilt: %d\n", moveSpeed, moveDuration, neutralPan, neutralTilt);
+        
+        Serial.println("Testing Pan LEFT...");
+        panServo.writeMicroseconds(neutralPan + moveSpeed);
+        delay(moveDuration);
+        panServo.writeMicroseconds(neutralPan);
+        delay(500);
+        
+        Serial.println("Testing Pan RIGHT...");
+        panServo.writeMicroseconds(neutralPan - moveSpeed);
+        delay(moveDuration);
+        panServo.writeMicroseconds(neutralPan);
+        delay(500);
+        
+        Serial.println("Testing Tilt UP...");
+        tiltServo.writeMicroseconds(neutralTilt + moveSpeed);
+        delay(moveDuration);
+        tiltServo.writeMicroseconds(neutralTilt);
+        delay(500);
+        
+        Serial.println("Testing Tilt DOWN...");
+        tiltServo.writeMicroseconds(neutralTilt - moveSpeed);
+        delay(moveDuration);
+        tiltServo.writeMicroseconds(neutralTilt);
+        
+        Serial.println("✓ Test complete");
+        return;
+    }
+    
+    // SERVO_STATUS: Show current settings
+    if (cmd == "SERVO_STATUS") {
+        Serial.println("=== 360° SERVO STATUS ===");
+        Serial.printf("Attached: %s\n", panServo.attached() ? "YES" : "NO");
+        Serial.printf("Neutral Pan: %dµs, Tilt: %dµs\n", neutralPan, neutralTilt);
+        Serial.printf("Speed: %d (pulse offset from neutral)\n", moveSpeed);
+        Serial.printf("Duration: %dms per command\n", moveDuration);
+        Serial.println("Commands: PAN_LEFT, PAN_RIGHT, TILT_UP, TILT_DOWN");
+        Serial.println("Calibration: SERVO_CAL:XXXX (try 1400-1600)");
+        return;
+    }
+    
+    // SERVO_PAN:angle - 180° position servo (30-150°) with smooth movement
+    if (cmd.startsWith("SERVO_PAN:")) {
+        if (!panServo.attached()) {
+            Serial.println("Pan servo disabled - send SERVO_ENABLE first");
+            return;
+        }
+        int targetAngle = cmd.substring(10).toInt();
+        if (targetAngle < 30 || targetAngle > 150) {
+            Serial.printf("Invalid pan angle %d (use 30-150)\n", targetAngle);
+            return;
+        }
+        
+        // Smooth movement - move 1 degree at a time
+        Serial.printf("Pan servo: %d° -> %d°\n", currentPanAngle, targetAngle);
+        if (currentPanAngle < targetAngle) {
+            for (int pos = currentPanAngle; pos <= targetAngle; pos++) {
+                panServo.write(pos);
+                delay(servoStepDelay);
+            }
+        } else {
+            for (int pos = currentPanAngle; pos >= targetAngle; pos--) {
+                panServo.write(pos);
+                delay(servoStepDelay);
+            }
+        }
+        currentPanAngle = targetAngle;
+        Serial.println("✓ Done");
+        return;
+    }
+    
+    // SERVO_TILT:angle - 180° position servo (30-150°) with smooth movement
+    if (cmd.startsWith("SERVO_TILT:")) {
+        if (!tiltServo.attached()) {
+            Serial.println("Tilt servo disabled - send SERVO_ENABLE first");
+            return;
+        }
+        int targetAngle = cmd.substring(11).toInt();
+        if (targetAngle < 30 || targetAngle > 150) {
+            Serial.printf("Invalid tilt angle %d (use 30-150)\n", targetAngle);
+            return;
+        }
+        
+        // Smooth movement - move 1 degree at a time
+        Serial.printf("Tilt servo: %d° -> %d°\n", currentTiltAngle, targetAngle);
+        if (currentTiltAngle < targetAngle) {
+            for (int pos = currentTiltAngle; pos <= targetAngle; pos++) {
+                tiltServo.write(pos);
+                delay(servoStepDelay);
+            }
+        } else {
+            for (int pos = currentTiltAngle; pos >= targetAngle; pos--) {
+                tiltServo.write(pos);
+                delay(servoStepDelay);
+            }
+        }
+        currentTiltAngle = targetAngle;
+        Serial.println("✓ Done");
+        return;
+    }
+    
+    // SERVO_HELP: Show all commands
+    if (cmd == "SERVO_HELP") {
+        Serial.println("=== SERVO COMMANDS ===");
+        Serial.println("SERVO_ENABLE     - Attach servos");
+        Serial.println("SERVO_DISABLE    - Detach servos");
+        Serial.println("SERVO_STOP/STOP  - Emergency stop");
+        Serial.println("");
+        Serial.println("180° Position Servo Commands:");
+        Serial.println("  SERVO_PAN:90   - Set pan angle (30-150°)");
+        Serial.println("  SERVO_TILT:90  - Set tilt angle (30-150°)");
+        Serial.println("");
+        Serial.println("360° Continuous Rotation Commands:");
+        Serial.println("  PAN_LEFT       - Rotate pan left");
+        Serial.println("  PAN_RIGHT      - Rotate pan right");
+        Serial.println("  TILT_UP        - Rotate tilt up");
+        Serial.println("  TILT_DOWN      - Rotate tilt down");
+        Serial.println("  SERVO_SPEED:XX - Speed 10-200");
+        Serial.println("  SERVO_DURATION:XX - Duration ms");
+        Serial.println("  SERVO_STATUS   - Show settings");
+        return;
+    }
 }
 
 // ============== SERVO UPDATE ==============
+// For 360° continuous rotation servos, movement is handled directly in commands
+// This function is kept for compatibility but does nothing for continuous rotation
 void updateServos() {
-    if (currentPan != targetPan) {
-        if (currentPan < targetPan) currentPan = min(currentPan + 2, targetPan);
-        else currentPan = max(currentPan - 2, targetPan);
-        panServo.write(currentPan);
-    }
-    
-    if (currentTilt != targetTilt) {
-        if (currentTilt < targetTilt) currentTilt = min(currentTilt + 2, targetTilt);
-        else currentTilt = max(currentTilt - 2, targetTilt);
-        tiltServo.write(currentTilt);
-    }
+    // 360° servos don't need position updates - they're controlled via timed pulses
+    // Movement commands (PAN_LEFT, TILT_UP, etc.) handle start/stop directly
 }
 
 // ============== LED UPDATE ==============
@@ -824,10 +1264,15 @@ void drawFace() {
             display.fillRect(78, 28, 30, 4, SSD1306_WHITE);
             // ZZZ
             display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
             display.setCursor(100, 10);
             display.print("z");
             display.setCursor(105, 5);
             display.print("Z");
+            // Scrolling "SAY HI LUMINA" text at bottom
+            display.setTextSize(2);
+            display.setCursor(scrollX, 48);
+            display.print("SAY HI LUMINA");
             break;
             
         case FACE_HAPPY:
@@ -974,37 +1419,64 @@ void playTone(int freq, int duration_ms) {
 
 // ============== I2S AUDIO SETUP ==============
 void setupI2S() {
-    // Configure I2S for microphone input (INMP441 or similar)
+    // Configure I2S for microphone input
     i2s_config_t i2s_mic_config = {
+#if USE_ADC_MIC
+        // MAX4466 analog mic - use ADC mode
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
+#else
+        // Digital I2S microphone (INMP441, SPH0645, etc.)
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+#endif
         .sample_rate = I2S_SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+#if USE_ADC_MIC
+        .communication_format = I2S_COMM_FORMAT_I2S_LSB,
+#else
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+#endif
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
+        .dma_buf_count = 2,  // Fewer buffers for lower latency
         .dma_buf_len = I2S_BUFFER_SIZE,
         .use_apll = false,
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0
     };
     
+#if !USE_ADC_MIC
+    // Pin config only needed for digital I2S mic
     i2s_pin_config_t pin_mic_config = {
         .bck_io_num = PIN_I2S_BCLK,
         .ws_io_num = PIN_I2S_LRC,
         .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num = PIN_I2S_DIN
     };
+#endif
     
     if (i2s_driver_install(I2S_MIC_PORT, &i2s_mic_config, 0, NULL) != ESP_OK) {
         Serial.println("✗ I2S mic driver install failed!");
         return;
     }
     
+#if USE_ADC_MIC
+    // ADC config for MAX4466 (GPIO35)
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC_MIC_CHANNEL, ADC_ATTEN_DB_11);
+    // Characterize ADC (useful for mV conversions if needed)
+    esp_adc_cal_characteristics_t *adc_chars = (esp_adc_cal_characteristics_t*)calloc(1, sizeof(esp_adc_cal_characteristics_t));
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, DEFAULT_VREF, adc_chars);
+
+    i2s_set_adc_mode(ADC_UNIT_1, ADC_MIC_CHANNEL);
+    i2s_adc_enable(I2S_MIC_PORT);
+    Serial.println("✓ I2S microphone (ADC mode - MAX4466 on GPIO35) ready");
+#else
     if (i2s_set_pin(I2S_MIC_PORT, &pin_mic_config) != ESP_OK) {
         Serial.println("✗ I2S mic pin config failed!");
         return;
     }
+    Serial.println("✓ I2S microphone (digital) ready");
+#endif
     
     // Clear I2S buffers to prevent initial noise
     i2s_zero_dma_buffer(I2S_MIC_PORT);
@@ -1129,15 +1601,74 @@ void micStreamTask(void* param) {
     Serial.println("Mic streaming task started");
     
     while (audioStreamingActive) {
-        // Read from I2S microphone
+#if USE_ADC_MIC
+        // Read from I2S ADC - returns 16-bit raw ADC values (12-bit useful)
+        uint16_t adcBuffer[I2S_BUFFER_SIZE];
+        i2s_read(I2S_MIC_PORT, adcBuffer, I2S_BUFFER_SIZE * sizeof(uint16_t), &bytes_read, portMAX_DELAY);
+        
+        if (bytes_read > 0 && brainConnected) {
+            int numSamples = bytes_read / sizeof(uint16_t);
+
+            // Convert ADC samples (0..4095) to signed 16-bit and remove DC offset per packet
+            int64_t sum = 0;
+            for (int i = 0; i < numSamples; i++) {
+                uint16_t adcVal = adcBuffer[i] & 0x0FFF; // 12-bit ADC
+                int32_t centered = (int32_t)adcVal - 2048; // center around 0
+                micBuffer[i] = (int16_t)(centered << 4);  // scale to 16-bit
+                sum += micBuffer[i];
+            }
+
+            // Remove packet mean to eliminate DC offset / rumble
+            int16_t mean = (int16_t)(sum / numSamples);
+            for (int i = 0; i < numSamples; i++) {
+                micBuffer[i] = micBuffer[i] - mean;
+            }
+
+            // Apply a lightweight IIR high-pass filter across packets to remove low-frequency rumble
+            static float hp_prev_x = 0.0f;
+            static float hp_prev_y = 0.0f;
+            const float hp_alpha = 0.99f; // gentler high-pass to preserve speech
+            for (int i = 0; i < numSamples; i++) {
+                float xf = (float)micBuffer[i];
+                float y = hp_alpha * (hp_prev_y + xf - hp_prev_x);
+                hp_prev_x = xf;
+                hp_prev_y = y;
+                // No attenuation here; preserve level and soft-limit
+                float scaled = y;
+                if (scaled > 32700.0f) scaled = 32700.0f;
+                if (scaled < -32700.0f) scaled = -32700.0f;
+                micBuffer[i] = (int16_t)scaled;
+            }
+
+            // Prepend a small header: 4-byte sequence number, 4-byte timestamp (millis)
+            static uint32_t seq = 0;
+            uint32_t ts = millis();
+            uint8_t pktbuf[8 + numSamples * sizeof(int16_t)];
+            pktbuf[0] = (seq >> 24) & 0xFF;
+            pktbuf[1] = (seq >> 16) & 0xFF;
+            pktbuf[2] = (seq >> 8) & 0xFF;
+            pktbuf[3] = (seq >> 0) & 0xFF;
+            pktbuf[4] = (ts >> 24) & 0xFF;
+            pktbuf[5] = (ts >> 16) & 0xFF;
+            pktbuf[6] = (ts >> 8) & 0xFF;
+            pktbuf[7] = (ts >> 0) & 0xFF;
+            memcpy(&pktbuf[8], micBuffer, numSamples * sizeof(int16_t));
+            
+            audioOutUdp.beginPacket(brainIP, UDP_AUDIO_OUT_PORT);
+            audioOutUdp.write(pktbuf, 8 + numSamples * sizeof(int16_t));
+            audioOutUdp.endPacket();
+            seq++;
+        }
+#else
+        // Digital I2S microphone - data is already in correct format
         i2s_read(I2S_MIC_PORT, micBuffer, I2S_BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
         
         if (bytes_read > 0 && brainConnected) {
-            // Send audio data to laptop via UDP
             audioOutUdp.beginPacket(brainIP, UDP_AUDIO_OUT_PORT);
             audioOutUdp.write((uint8_t*)micBuffer, bytes_read);
             audioOutUdp.endPacket();
         }
+#endif
         
         // Small yield to prevent watchdog timeout
         vTaskDelay(1);
