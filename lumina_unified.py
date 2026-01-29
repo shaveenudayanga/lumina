@@ -77,11 +77,11 @@ class Config:
     # Network - Device IPs (auto-discovered or set manually)
     # Set CAM_IP to your ESP32-CAM's IP address, e.g., "192.168.1.100"
     # Leave as None to use local webcam
-    BODY_IP = "192.168.109.68"  # ESP32 DevKit body IP
+    BODY_IP = "192.168.228.68"  # ESP32 DevKit body IP
     BODY_PORT = 5005        # UDP port for body commands
     AUDIO_IN_PORT = 5006    # Port to receive audio FROM ESP32 mic
     AUDIO_OUT_PORT = 5007   # Port to send audio TO ESP32 speaker
-    CAM_IP = None  # Set to None to use local webcam
+    CAM_IP = None  # Set to None to use local webcam (ESP32-CAM IP: 192.168.109.68)
     CAM_PORT = 80           # HTTP port for camera stream
     
     # Serial (fallback if network not available)
@@ -90,20 +90,26 @@ class Config:
     # Vision thresholds
     MIN_ASPECT_RATIO = 1.3
     OPENNESS_THRESHOLD = 0.85
-    DEADZONE = 30  # Reduced for faster response
+    DEADZONE = 15  # Pixels from center before servo moves (prevents jitter)
     # Verticality thresholds for palm/nails detection
     VERTICALITY_RATIO = 1.5   # abs(dy) / (abs(dx)+eps) must exceed this to be considered vertical
     VERTICAL_DY = 0.02        # minimum absolute normalized dy to consider as up/down
 
-    # Servo tracking settings - adjusted for smooth 180° servos
-    PAN_GAIN = 0.15   # Increased for more responsive tracking
-    TILT_GAIN = 0.30  # Increased 1.5x for more sensitive vertical tracking
-    SMOOTHING = 0.5   # Lower = faster response (was 0.7)
-    PAN_MIN, PAN_MAX = 30, 150  # Safe range for 180° servos
-    TILT_MIN, TILT_MAX = 60, 120  # REDUCED - physical mount limits!
+    # Servo tracking settings - CENTER-FOLLOWING CONTROL
+    # The camera is mounted on the servos, so we adjust servo to CENTER the hand
+    # Error = (hand_position - frame_center) → Servo adjusts to reduce error to zero
+    PAN_GAIN = 0.08    # Proportional gain for pan (degrees per pixel error)
+    TILT_GAIN = 0.12   # Proportional gain for tilt (degrees per pixel error)
+    SMOOTHING = 0.3    # Low-pass filter (0=instant, 1=no change). Lower = faster
+    PAN_MIN, PAN_MAX = 0, 180  # 90° range each side from center (90°)
+    TILT_MIN, TILT_MAX = 30, 150  # 60° range each side from center (90°)
+    # Center offset calibration (if camera not perfectly centered)
+    PAN_CENTER = 90    # Servo position when looking straight ahead
+    TILT_CENTER = 90   # Servo position when looking straight ahead
     
-    # Gemini Live API
-    LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+    # Gemini Live API  
+    # Valid models for Live API with native audio: gemini-2.5-flash-native-audio-preview-12-2025
+    LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
     
     # Audio settings
     SEND_SAMPLE_RATE = 16000
@@ -525,7 +531,10 @@ class RobotController:
         color_lower = color_name.lower().strip()
         if color_lower in colors:
             r, g, b = colors[color_lower]
-            self.set_color(r, g, b)
+            # Update simulation state
+            RobotController.current_color = (r, g, b)
+            self.send_command(f"COLOR:{color_name}")
+            print(f"🎨 Color: {color_name} RGB({r},{g},{b})")
         else:
             # Try to send as-is to ESP32 which also has color parsing
             self.send_command(f"COLOR:{color_name}")
@@ -966,22 +975,46 @@ class VisionSystem:
                 hand_cx = int(self.smoothed_hand_x)
                 hand_cy = int(self.smoothed_hand_y)
                 
-                # DIRECT MAPPING: Map hand screen position directly to servo angle
-                # (Fixed camera mode - servo doesn't move camera view)
-                # hand_cx: 0 (left edge) -> w (right edge)
-                # Map to: PAN_MIN -> PAN_MAX
-                target_pan = Config.PAN_MIN + (hand_cx / w) * (Config.PAN_MAX - Config.PAN_MIN)
-                target_tilt = Config.TILT_MIN + (hand_cy / h) * (Config.TILT_MAX - Config.TILT_MIN)
+                # ============== CENTER-FOLLOWING CONTROL ==============
+                # The camera is mounted on the servo, so we need to MOVE the servo
+                # to CENTER the hand in the frame. This is a closed-loop control:
+                #   error = hand_position - frame_center
+                #   servo += gain * error
+                # When error is zero, hand is centered and servo stops moving.
                 
-                # Smooth transition to target (prevents sudden jumps)
-                self.current_pan = Config.SMOOTHING * self.current_pan + (1 - Config.SMOOTHING) * target_pan
-                self.current_tilt = Config.SMOOTHING * self.current_tilt + (1 - Config.SMOOTHING) * target_tilt
+                # Calculate error (pixels from center)
+                error_x = hand_cx - center_x  # Positive = hand is right of center
+                error_y = hand_cy - center_y  # Positive = hand is below center
                 
+                # Apply deadzone to prevent jitter when hand is near center
+                if abs(error_x) < Config.DEADZONE:
+                    error_x = 0
+                if abs(error_y) < Config.DEADZONE:
+                    error_y = 0
+                
+                # Calculate servo adjustment (proportional control)
+                # Pan: hand right of center → need to pan RIGHT (increase pan angle)
+                # Tilt: hand below center → need to tilt DOWN (increase tilt angle)
+                pan_adjustment = Config.PAN_GAIN * error_x
+                tilt_adjustment = Config.TILT_GAIN * error_y
+                
+                # Update servo positions
+                self.current_pan += pan_adjustment
+                self.current_tilt += tilt_adjustment
+                
+                # Clamp to safe servo range
                 self.current_pan = max(Config.PAN_MIN, min(Config.PAN_MAX, self.current_pan))
                 self.current_tilt = max(Config.TILT_MIN, min(Config.TILT_MAX, self.current_tilt))
                 
+                # Draw tracking visualization
+                # Green line from center to hand
                 cv2.line(img, (center_x, center_y), (hand_cx, hand_cy), (0, 255, 0), 2)
+                # Target crosshair at center
+                cv2.drawMarker(img, (center_x, center_y), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+                # Hand position marker
                 cv2.circle(img, (hand_cx, hand_cy), 10, (0, 255, 0), cv2.FILLED)
+                # Error text
+                cv2.putText(img, f"err:({error_x},{error_y})", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
             
             self.mp_draw.draw_landmarks(img, hand_lms, self.mp_hands.HAND_CONNECTIONS)
         
@@ -1397,6 +1430,7 @@ class LiveConversation:
         
         if self.robot:
             self.robot.set_face("LISTENING")
+            # Don't change LED color - keep current color
             # If using ESP32 audio, tell it to start streaming
             if self.use_esp32_audio:
                 print("📡 Starting ESP32 audio streaming...")
@@ -1503,6 +1537,10 @@ def main():
     
     # Initialize components
     controller = RobotController()
+    
+    # Set default white LED on startup
+    controller.set_brightness(80)
+    controller.set_color_name("white")
     
     # Send startup greeting to eyes display
     controller.send_command("TEXT:Hi Lumina")

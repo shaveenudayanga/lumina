@@ -762,6 +762,9 @@ void parseCommand(String cmd) {
         int g = cmd.substring(c1 + 1, c2).toInt();
         int b = cmd.substring(c2 + 1).toInt();
         currentColor = CRGB(r, g, b);
+        fill_solid(leds, NUM_LEDS, currentColor);
+        FastLED.show();
+        Serial.printf("LED: COLOR R=%d G=%d B=%d\n", currentColor.r, currentColor.g, currentColor.b);
         return;
     }
     
@@ -791,7 +794,7 @@ void parseCommand(String cmd) {
     // Enable/disable chat mode remotely
     if (cmd == "CHAT_START") {
         chatMode = true;
-        currentColor = CRGB::Green;
+        // Don't change LED color - keep current color
         currentFace = FACE_LISTENING;
         // Enable amp for remote chat start
         digitalWrite(PIN_AMP_EN, HIGH);
@@ -1168,20 +1171,23 @@ void parseCommand(String cmd) {
             return;
         }
         
+        // Invert tilt direction (flip the servo)
+        int invertedAngle = 180 - targetAngle;
+        
         // Smooth movement - move 1 degree at a time
-        Serial.printf("Tilt servo: %d° -> %d°\n", currentTiltAngle, targetAngle);
-        if (currentTiltAngle < targetAngle) {
-            for (int pos = currentTiltAngle; pos <= targetAngle; pos++) {
+        Serial.printf("Tilt servo: %d° -> %d° (inverted to %d°)\n", currentTiltAngle, targetAngle, invertedAngle);
+        if (currentTiltAngle < invertedAngle) {
+            for (int pos = currentTiltAngle; pos <= invertedAngle; pos++) {
                 tiltServo.write(pos);
                 delay(servoStepDelay);
             }
         } else {
-            for (int pos = currentTiltAngle; pos >= targetAngle; pos--) {
+            for (int pos = currentTiltAngle; pos >= invertedAngle; pos--) {
                 tiltServo.write(pos);
                 delay(servoStepDelay);
             }
         }
-        currentTiltAngle = targetAngle;
+        currentTiltAngle = invertedAngle;
         Serial.println("✓ Done");
         return;
     }
