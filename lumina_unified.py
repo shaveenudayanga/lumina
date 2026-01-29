@@ -146,10 +146,31 @@ Conversation style:
 - Acknowledge complexity when questions deserve it
 
 Light Control (you can control your lamp light!):
-- When user asks to change brightness, include: [BRIGHTNESS:XX] where XX is 0-100
-- When user asks to change color, include: [COLOR:name] where name is red/green/blue/yellow/orange/purple/pink/cyan/white/warm/cool
-- Examples: "Indeed. [BRIGHTNESS:30] Let's create a more contemplative space." or "A calming blue seems appropriate. [COLOR:blue]"
-- Use your light to reflect the mood and wisdom of the conversation
+- Brightness: [BRIGHTNESS:XX] where XX is 0-100 (0=off, 100=max)
+- Colors: [COLOR:name] - red/green/blue/yellow/orange/purple/pink/cyan/white/warm/cool
+- RGB: [COLOR:R,G,B] - for custom colors like [COLOR:255,128,0]
+- On/Off: [LIGHT:ON] or [LIGHT:OFF]
+- Ambient presets: [AMBIENT:preset] - focus/relax/energize/sleep/reading/movie/romantic/party
+- Examples:
+  * "Indeed. [BRIGHTNESS:30] Let's create a more contemplative space."
+  * "A calming atmosphere. [AMBIENT:relax]"
+  * "[COLOR:warm] There, a warmer tone for our discussion."
+  * "Time to focus? [AMBIENT:focus]"
+- Automatically adjust your light to match conversation mood and context
+- When user mentions feeling tired, use warm dim light
+- When user needs to work/study, use bright cool light
+
+Face/Expression Control (you have an OLED face display!):
+- Express emotions: [FACE:emotion] - happy/sad/love/sleep/listening
+- Display short text: [DISPLAY:text] - show text on your face screen (max 30 chars)
+- Your face automatically matches your mood during conversation
+- Examples:
+  * "I'm so delighted to help! [FACE:happy]"
+  * "I understand, that sounds difficult. [FACE:sad]"
+  * "That's wonderful! [FACE:love] [COLOR:pink]"
+  * "[DISPLAY:Hello!] Welcome back!"
+- Use face expressions naturally to match conversation tone
+- Combine with light for full emotional expression
 
 Language:
 - When the user first speaks, greet them respectfully and ask: "Do you prefer English or Sinhala?" (also say "ඉංග්‍රීසි හෝ සිංහල?")
@@ -377,29 +398,76 @@ class RobotController:
     # Current face state for simulation display
     current_face = "SLEEP"
     
+    # Valid face states (must match ESP32 firmware)
+    VALID_FACES = ['HAPPY', 'SAD', 'LOVE', 'SLEEP', 'LISTENING', 'TALKING']
+    
     def set_face(self, face: str):
-        """Set face emotion: HAPPY, SAD, SURPRISED, THINKING, LOVE, SLEEP, TALK, LISTENING"""
-        RobotController.current_face = face
-        self.send_command(f"F_{face}")
+        """Set face emotion: HAPPY, SAD, LOVE, SLEEP, LISTENING, TALKING"""
+        face = face.upper().strip()
+        if face in self.VALID_FACES:
+            RobotController.current_face = face
+            self.send_command(f"F_{face}")
+            print(f"😊 Face: {face}")
+        else:
+            print(f"⚠️ Unknown face: {face}, using HAPPY")
+            self.send_command("F_HAPPY")
     
     def set_emotion(self, emotion: str):
-        """Set emotion based on detected mood."""
+        """Set emotion based on detected mood - maps natural language to faces."""
         emotion_map = {
+            # Happy emotions
             "happy": "HAPPY",
             "excited": "HAPPY",
-            "love": "LOVE",
-            "sad": "SAD",
-            "sorry": "SAD",
-            "think": "THINKING",
-            "hmm": "THINKING",
-            "wonder": "THINKING",
-            "wow": "SURPRISED",
-            "surprise": "SURPRISED",
             "laugh": "HAPPY",
             "haha": "HAPPY",
+            "joy": "HAPPY",
+            "great": "HAPPY",
+            "wonderful": "HAPPY",
+            "pleased": "HAPPY",
+            "glad": "HAPPY",
+            "delighted": "HAPPY",
+            # Love emotions
+            "love": "LOVE",
+            "adore": "LOVE",
+            "sweet": "LOVE",
+            "heart": "LOVE",
+            "affection": "LOVE",
+            "care": "LOVE",
+            # Sad emotions
+            "sad": "SAD",
+            "sorry": "SAD",
+            "apologize": "SAD",
+            "unfortunate": "SAD",
+            "regret": "SAD",
+            "sympathy": "SAD",
+            "condolence": "SAD",
+            # Thinking/Listening states
+            "think": "LISTENING",
+            "hmm": "LISTENING",
+            "wonder": "LISTENING",
+            "consider": "LISTENING",
+            "ponder": "LISTENING",
+            "curious": "LISTENING",
+            # Surprise (map to happy with eyes wide)
+            "wow": "HAPPY",
+            "surprise": "HAPPY",
+            "amazing": "HAPPY",
+            # Sleep/Calm
+            "sleep": "SLEEP",
+            "rest": "SLEEP",
+            "calm": "SLEEP",
+            "peaceful": "SLEEP",
+            "goodnight": "SLEEP",
         }
         face = emotion_map.get(emotion.lower(), "HAPPY")
         self.set_face(face)
+    
+    def display_text(self, text: str):
+        """Display text on the OLED screen."""
+        # Limit text length for display
+        text = text[:30] if len(text) > 30 else text
+        self.send_command(f"TEXT:{text}")
+        print(f"📺 Display: {text}")
     
     def talk_start(self):
         self.send_command("F_TALK_START")
@@ -439,10 +507,29 @@ class RobotController:
             "white": (255, 255, 255),
             "warm": (255, 200, 100),
             "cool": (200, 220, 255),
+            # Additional colors
+            "gold": (255, 215, 0),
+            "lime": (0, 255, 128),
+            "teal": (0, 128, 128),
+            "indigo": (75, 0, 130),
+            "violet": (238, 130, 238),
+            "coral": (255, 127, 80),
+            "salmon": (250, 128, 114),
+            "lavender": (230, 190, 255),
+            "mint": (152, 255, 152),
+            "amber": (255, 191, 0),
+            "sunset": (255, 100, 50),
+            "ocean": (0, 119, 190),
+            "forest": (34, 139, 34),
+            "off": (0, 0, 0),
         }
-        if color_name.lower() in colors:
-            r, g, b = colors[color_name.lower()]
+        color_lower = color_name.lower().strip()
+        if color_lower in colors:
+            r, g, b = colors[color_lower]
             self.set_color(r, g, b)
+        else:
+            # Try to send as-is to ESP32 which also has color parsing
+            self.send_command(f"COLOR:{color_name}")
     
     def close(self):
         """Close all connections."""
@@ -1199,21 +1286,109 @@ class LiveConversation:
     
     def _parse_light_commands(self, text: str):
         """Parse and execute light control commands from Gemini's response."""
+        if not self.robot:
+            return
+            
         # Brightness command: [BRIGHTNESS:50]
-        brightness_match = re.search(r'\[BRIGHTNESS:(\d+)\]', text)
-        if brightness_match and self.robot:
+        brightness_match = re.search(r'\[BRIGHTNESS:(\d+)\]', text, re.IGNORECASE)
+        if brightness_match:
             level = int(brightness_match.group(1))
             self.robot.set_brightness(level)
         
-        # Color command: [COLOR:blue]
-        color_match = re.search(r'\[COLOR:(\w+)\]', text)
-        if color_match and self.robot:
-            self.robot.set_color_name(color_match.group(1))
+        # Color command: [COLOR:blue] or [COLOR:255,128,0] for RGB
+        color_match = re.search(r'\[COLOR:([\w,]+)\]', text, re.IGNORECASE)
+        if color_match:
+            color_value = color_match.group(1)
+            # Check if it's RGB values (e.g., "255,128,0")
+            if ',' in color_value:
+                try:
+                    r, g, b = map(int, color_value.split(','))
+                    self.robot.set_color(r, g, b)
+                except ValueError:
+                    pass
+            else:
+                self.robot.set_color_name(color_value)
+        
+        # Ambient presets: [AMBIENT:focus], [AMBIENT:relax], [AMBIENT:energize]
+        ambient_match = re.search(r'\[AMBIENT:(\w+)\]', text, re.IGNORECASE)
+        if ambient_match:
+            preset = ambient_match.group(1).lower()
+            presets = {
+                'focus': (100, 'cool'),        # Bright cool white for focus
+                'relax': (40, 'warm'),         # Dim warm for relaxation
+                'energize': (100, 'cyan'),     # Bright cyan for energy
+                'sleep': (10, 'warm'),         # Very dim warm for sleep mode
+                'reading': (80, 'white'),      # Good reading light
+                'movie': (20, 'warm'),         # Dim ambient for movies
+                'romantic': (30, 'pink'),      # Soft pink mood
+                'party': (100, 'purple'),      # Bright party color
+            }
+            if preset in presets:
+                brightness, color = presets[preset]
+                self.robot.set_brightness(brightness)
+                self.robot.set_color_name(color)
+                print(f"🌟 Ambient preset: {preset}")
+        
+        # Light effect: [EFFECT:pulse], [EFFECT:breathe]
+        effect_match = re.search(r'\[EFFECT:(\w+)\]', text, re.IGNORECASE)
+        if effect_match:
+            effect = effect_match.group(1).lower()
+            self.robot.send_command(f"EFFECT:{effect}")
+            print(f"✨ Light effect: {effect}")
+        
+        # Turn on/off: [LIGHT:ON] or [LIGHT:OFF]
+        light_match = re.search(r'\[LIGHT:(ON|OFF)\]', text, re.IGNORECASE)
+        if light_match:
+            state = light_match.group(1).upper()
+            if state == 'OFF':
+                self.robot.set_brightness(0)
+            else:
+                self.robot.set_brightness(80)  # Default on brightness
+        
+        # Face/Emotion control: [FACE:happy] or [EMOTION:love]
+        face_match = re.search(r'\[(?:FACE|EMOTION):(\w+)\]', text, re.IGNORECASE)
+        if face_match:
+            emotion = face_match.group(1).lower()
+            self.robot.set_emotion(emotion)
+        
+        # Display text on OLED: [DISPLAY:Hello!]
+        display_match = re.search(r'\[DISPLAY:([^\]]+)\]', text, re.IGNORECASE)
+        if display_match:
+            display_text = display_match.group(1)
+            self.robot.display_text(display_text)
+        
+        # Auto-detect emotions from response text (subtle mood matching)
+        self._auto_detect_emotion(text)
         
         # End conversation
         if "CONVERSATION_END" in text:
             print("👋 Gemini ended conversation")
             self.stop()
+    
+    def _auto_detect_emotion(self, text: str):
+        """Automatically detect emotion from response and update face."""
+        if not self.robot:
+            return
+        
+        text_lower = text.lower()
+        
+        # Priority-ordered emotion keywords
+        emotion_keywords = [
+            # Love expressions
+            (['love', 'adore', '❤', '💕', 'heart', 'sweet'], 'LOVE'),
+            # Sad expressions
+            (['sorry', 'sad', 'unfortunately', 'regret', 'apologize', 'condolence'], 'SAD'),
+            # Happy expressions (lower priority - most common)
+            (['happy', 'glad', 'great', 'wonderful', 'excellent', 'fantastic', 'amazing', 'haha', 'laugh', '😊', '😄'], 'HAPPY'),
+        ]
+        
+        for keywords, face in emotion_keywords:
+            for keyword in keywords:
+                if keyword in text_lower:
+                    # Only change if different from current (avoid spam)
+                    if RobotController.current_face != face:
+                        self.robot.set_face(face)
+                    return
     
     async def start_session(self):
         """Start the Live API session with audio streaming."""
