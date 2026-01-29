@@ -98,11 +98,11 @@ class Config:
     # Servo tracking settings - CENTER-FOLLOWING CONTROL
     # The camera is mounted on the servos, so we adjust servo to CENTER the hand
     # Error = (hand_position - frame_center) → Servo adjusts to reduce error to zero
-    PAN_GAIN = 0.08    # Proportional gain for pan (degrees per pixel error)
-    TILT_GAIN = 0.12   # Proportional gain for tilt (degrees per pixel error)
-    SMOOTHING = 0.3    # Low-pass filter (0=instant, 1=no change). Lower = faster
-    PAN_MIN, PAN_MAX = 0, 180  # 90° range each side from center (90°)
-    TILT_MIN, TILT_MAX = 30, 150  # 60° range each side from center (90°)
+    PAN_GAIN = 0.15    # Proportional gain for pan (degrees per pixel error) - higher = faster tracking
+    TILT_GAIN = 0.15   # Proportional gain for tilt (degrees per pixel error) - higher = faster tracking
+    SMOOTHING = 0.2    # Low-pass filter (0=instant, 1=no change). Lower = faster response
+    PAN_MIN, PAN_MAX = 0, 180  # Full 180° range for pan
+    TILT_MIN, TILT_MAX = 30, 150  # Limited tilt range to avoid mechanical issues
     # Center offset calibration (if camera not perfectly centered)
     PAN_CENTER = 90    # Servo position when looking straight ahead
     TILT_CENTER = 90   # Servo position when looking straight ahead
@@ -379,26 +379,30 @@ class RobotController:
                 pass
     
     def move(self, pan: int, tilt: int):
-        """Move servos with rate limiting and duplicate filtering."""
+        """Move servos with rate limiting and smart command filtering."""
         now = time.time()
-        
-        # Skip if same position as last time
-        if pan == self._last_pan and tilt == self._last_tilt:
-            return
         
         # Skip if sending too fast (rate limiting)
         if now - self._last_move_time < self._move_interval:
             return
         
-        # Send command and update tracking
-        self._last_pan = pan
-        self._last_tilt = tilt
+        # Only send commands for values that changed
+        pan_changed = pan != self._last_pan
+        tilt_changed = tilt != self._last_tilt
+        
+        if not pan_changed and not tilt_changed:
+            return
+        
+        # Update tracking
         self._last_move_time = now
-        # Use new servo command format for smooth 180° position control
-        print(f"SENDING: SERVO_PAN:{pan}")
-        self.send_command(f"SERVO_PAN:{pan}")
-        print(f"SENDING: SERVO_TILT:{tilt}")
-        self.send_command(f"SERVO_TILT:{tilt}")
+        
+        # Send only changed commands (reduces UDP traffic)
+        if pan_changed:
+            self._last_pan = pan
+            self.send_command(f"SERVO_PAN:{pan}")
+        if tilt_changed:
+            self._last_tilt = tilt
+            self.send_command(f"SERVO_TILT:{tilt}")
     
     # Current face state for simulation display
     current_face = "SLEEP"
@@ -1717,7 +1721,6 @@ def main():
             if locked:
                 with state_lock:
                     current_state = State.TRACKING
-                print(f"DEBUG: pan={pan}, tilt={tilt}")  # Debug output
                 controller.move(pan, tilt)
                 if last_state != State.TRACKING:
                     controller.set_face("HAPPY")

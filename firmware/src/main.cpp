@@ -1129,37 +1129,31 @@ void parseCommand(String cmd) {
         return;
     }
     
-    // SERVO_PAN:angle - 180° position servo (30-150°) with smooth movement
+    // SERVO_PAN:angle - 180° position servo (0-180°) - instant movement for tracking
     if (cmd.startsWith("SERVO_PAN:")) {
         if (!panServo.attached()) {
             Serial.println("Pan servo disabled - send SERVO_ENABLE first");
             return;
         }
         int targetAngle = cmd.substring(10).toInt();
-        if (targetAngle < 30 || targetAngle > 150) {
-            Serial.printf("Invalid pan angle %d (use 30-150)\n", targetAngle);
+        if (targetAngle < 0 || targetAngle > 180) {
+            Serial.printf("Invalid pan angle %d (use 0-180)\n", targetAngle);
             return;
         }
         
-        // Smooth movement - move 1 degree at a time
-        Serial.printf("Pan servo: %d° -> %d°\n", currentPanAngle, targetAngle);
-        if (currentPanAngle < targetAngle) {
-            for (int pos = currentPanAngle; pos <= targetAngle; pos++) {
-                panServo.write(pos);
-                delay(servoStepDelay);
-            }
-        } else {
-            for (int pos = currentPanAngle; pos >= targetAngle; pos--) {
-                panServo.write(pos);
-                delay(servoStepDelay);
-            }
-        }
+        // Instant movement for responsive tracking (no delay)
+        panServo.write(targetAngle);
         currentPanAngle = targetAngle;
-        Serial.println("✓ Done");
+        // Only print occasionally to avoid serial bottleneck
+        static unsigned long lastPanPrint = 0;
+        if (millis() - lastPanPrint > 500) {
+            Serial.printf("Pan: %d°\n", targetAngle);
+            lastPanPrint = millis();
+        }
         return;
     }
     
-    // SERVO_TILT:angle - 180° position servo (30-150°) with smooth movement
+    // SERVO_TILT:angle - 180° position servo (30-150°) - instant movement for tracking
     if (cmd.startsWith("SERVO_TILT:")) {
         if (!tiltServo.attached()) {
             Serial.println("Tilt servo disabled - send SERVO_ENABLE first");
@@ -1174,21 +1168,15 @@ void parseCommand(String cmd) {
         // Invert tilt direction (flip the servo)
         int invertedAngle = 180 - targetAngle;
         
-        // Smooth movement - move 1 degree at a time
-        Serial.printf("Tilt servo: %d° -> %d° (inverted to %d°)\n", currentTiltAngle, targetAngle, invertedAngle);
-        if (currentTiltAngle < invertedAngle) {
-            for (int pos = currentTiltAngle; pos <= invertedAngle; pos++) {
-                tiltServo.write(pos);
-                delay(servoStepDelay);
-            }
-        } else {
-            for (int pos = currentTiltAngle; pos >= invertedAngle; pos--) {
-                tiltServo.write(pos);
-                delay(servoStepDelay);
-            }
-        }
+        // Instant movement for responsive tracking (no delay)
+        tiltServo.write(invertedAngle);
         currentTiltAngle = invertedAngle;
-        Serial.println("✓ Done");
+        // Only print occasionally to avoid serial bottleneck
+        static unsigned long lastTiltPrint = 0;
+        if (millis() - lastTiltPrint > 500) {
+            Serial.printf("Tilt: %d° (inv: %d°)\n", targetAngle, invertedAngle);
+            lastTiltPrint = millis();
+        }
         return;
     }
     
@@ -1200,8 +1188,8 @@ void parseCommand(String cmd) {
         Serial.println("SERVO_STOP/STOP  - Emergency stop");
         Serial.println("");
         Serial.println("180° Position Servo Commands:");
-        Serial.println("  SERVO_PAN:90   - Set pan angle (30-150°)");
-        Serial.println("  SERVO_TILT:90  - Set tilt angle (30-150°)");
+        Serial.println("  SERVO_PAN:90   - Set pan angle (0-180°)");
+        Serial.println("  SERVO_TILT:90  - Set tilt angle (30-150°, inverted)");
         Serial.println("");
         Serial.println("360° Continuous Rotation Commands:");
         Serial.println("  PAN_LEFT       - Rotate pan left");
