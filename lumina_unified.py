@@ -81,7 +81,7 @@ class Config:
     BODY_PORT = 5005        # UDP port for body commands
     AUDIO_IN_PORT = 5006    # Port to receive audio FROM ESP32 mic
     AUDIO_OUT_PORT = 5007   # Port to send audio TO ESP32 speaker
-    CAM_IP = None  # Set to None to use local webcam (ESP32-CAM IP: 192.168.109.68)
+    CAM_IP = None  # ESP32-CAM IP (set to None for local webcam)
     CAM_PORT = 80           # HTTP port for camera stream
     
     # Serial (fallback if network not available)
@@ -98,9 +98,9 @@ class Config:
     # Servo tracking settings - CENTER-FOLLOWING CONTROL
     # The camera is mounted on the servos, so we adjust servo to CENTER the hand
     # Error = (hand_position - frame_center) → Servo adjusts to reduce error to zero
-    PAN_GAIN = 0.15    # Proportional gain for pan (degrees per pixel error) - higher = faster tracking
-    TILT_GAIN = 0.15   # Proportional gain for tilt (degrees per pixel error) - higher = faster tracking
-    SMOOTHING = 0.2    # Low-pass filter (0=instant, 1=no change). Lower = faster response
+    PAN_GAIN = 0.008    # Proportional gain for pan (degrees per pixel error) - lower = slower/smoother
+    TILT_GAIN = 0.0    # Proportional gain for tilt (degrees per pixel error) - DISABLED
+    SMOOTHING = 0.5    # Low-pass filter (0=instant, 1=no change). Higher = smoother movement
     PAN_MIN, PAN_MAX = 0, 180  # Full 180° range for pan
     TILT_MIN, TILT_MAX = 30, 150  # Limited tilt range to avoid mechanical issues
     # Center offset calibration (if camera not perfectly centered)
@@ -108,7 +108,7 @@ class Config:
     TILT_CENTER = 90   # Servo position when looking straight ahead
     
     # Gemini Live API  
-    # Valid models for Live API with native audio: gemini-2.5-flash-native-audio-preview-12-2025
+    # Use the native audio model for best real-time performance
     LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
     
     # Audio settings
@@ -122,7 +122,6 @@ class Config:
     
     # Voice: Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, Zephyr
     # Aoede: Warm, friendly female voice (calm but approachable)
-    # Leda: Clear, professional female voice (intelligent)
     VOICE = "Aoede"
     
     # Wake words
@@ -166,6 +165,7 @@ Light Control (you can control your lamp light!):
   * "I'm here if you need to talk. [COLOR:warm]"
 - Automatically adjust your light to match conversation mood and context
 - Use soft, warm colors for comfort; clear, cool colors for focus
+- IMPORTANT: Only change light colors when the user specifically requests it or when it makes sense for the conversation context. Do not change colors automatically when starting a conversation.
 
 Face/Expression Control (you have an OLED face display!):
 - Express emotions: [FACE:emotion] - happy/sad/love/sleep/listening
@@ -304,6 +304,7 @@ class RobotController:
         """Send command via UDP to body. Attempts to resolve hostname on failure."""
         if self.udp_socket and self.body_ip:
             try:
+                print(f"📡 Sending to ESP32: {cmd}")  # Debug: show what's being sent
                 self.udp_socket.sendto(cmd.encode(), (self.body_ip, self.body_port))
             except socket.gaierror as e:
                 # Name resolution failed - try to resolve explicitly and retry once
@@ -386,23 +387,18 @@ class RobotController:
         if now - self._last_move_time < self._move_interval:
             return
         
-        # Only send commands for values that changed
+        # Only send pan commands (tilt disabled)
         pan_changed = pan != self._last_pan
-        tilt_changed = tilt != self._last_tilt
         
-        if not pan_changed and not tilt_changed:
+        if not pan_changed:
             return
         
         # Update tracking
         self._last_move_time = now
+        self._last_pan = pan
         
-        # Send only changed commands (reduces UDP traffic)
-        if pan_changed:
-            self._last_pan = pan
-            self.send_command(f"SERVO_PAN:{pan}")
-        if tilt_changed:
-            self._last_tilt = tilt
-            self.send_command(f"SERVO_TILT:{tilt}")
+        # Send only pan command (tilt servo disabled)
+        self.send_command(f"SERVO_PAN:{pan}")
     
     # Current face state for simulation display
     current_face = "SLEEP"
@@ -412,7 +408,15 @@ class RobotController:
     
     def set_face(self, face: str):
         """Set face emotion: HAPPY, SAD, LOVE, SLEEP, LISTENING, TALKING"""
+        # Normalize and sanitize
         face = face.upper().strip()
+        # Debug: print raw repr and byte values to catch stray characters
+        try:
+            byte_vals = [ord(c) for c in face]
+        except Exception:
+            byte_vals = []
+        print(f"🔧 set_face called: repr={repr(face)} bytes={byte_vals}")
+
         if face in self.VALID_FACES:
             RobotController.current_face = face
             self.send_command(f"F_{face}")
@@ -442,10 +446,8 @@ class RobotController:
             "heart": "LOVE",
             "affection": "LOVE",
             "care": "LOVE",
-            # Sad emotions
+            # Sad emotions (only explicit sad words remain)
             "sad": "SAD",
-            "sorry": "SAD",
-            "apologize": "SAD",
             "unfortunate": "SAD",
             "regret": "SAD",
             "sympathy": "SAD",
@@ -469,6 +471,7 @@ class RobotController:
             "goodnight": "SLEEP",
         }
         face = emotion_map.get(emotion.lower(), "HAPPY")
+        print(f"🔔 set_emotion: '{emotion}' -> {face}")
         self.set_face(face)
     
     def display_text(self, text: str):
@@ -479,10 +482,16 @@ class RobotController:
         print(f"📺 Display: {text}")
     
     def talk_start(self):
+        # Show talking face when AI is speaking
+        RobotController.current_face = "TALK_START"
         self.send_command("F_TALK_START")
+        print(f"📺 Talk start - face: TALK_START")
     
     def talk_stop(self):
+        # Show LISTENING face when AI stops speaking (user's turn)
+        RobotController.current_face = "LISTENING"
         self.send_command("F_TALK_STOP")
+        print(f"📺 Talk stop - face: LISTENING")
     
     # Current LED state for simulation
     current_brightness = 100
@@ -500,7 +509,7 @@ class RobotController:
         r, g, b = max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))
         RobotController.current_color = (r, g, b)
         self.send_command(f"C{r},{g},{b}")
-        print(f"🎨 Color: RGB({r},{g},{b})")
+        print(f"🎨 Color: RGB({r},{g},{b}) - DEBUG: current_color set to {RobotController.current_color}")
     
     def set_color_name(self, color_name: str):
         """Set LED color by name."""
@@ -538,7 +547,7 @@ class RobotController:
             # Update simulation state
             RobotController.current_color = (r, g, b)
             self.send_command(f"COLOR:{color_name}")
-            print(f"🎨 Color: {color_name} RGB({r},{g},{b})")
+            print(f"🎨 Color: {color_name} RGB({r},{g},{b}) - DEBUG: current_color set to {RobotController.current_color}")
         else:
             # Try to send as-is to ESP32 which also has color parsing
             self.send_command(f"COLOR:{color_name}")
@@ -556,56 +565,96 @@ class RobotController:
 
 # ============== MJPEG STREAM READER ==============
 class MJPEGStreamReader:
-    """Custom MJPEG stream reader for ESP32-CAM."""
-    def __init__(self, url):
+    """
+    Optimized MJPEG stream reader for ESP32-CAM.
+    
+    Uses OpenCV VideoCapture which handles MJPEG parsing internally.
+    This is more reliable than manual HTTP parsing.
+    """
+    def __init__(self, url, timeout=10):
         self.url = url
-        self.stream = None
+        self.timeout = timeout
+        self.cap = None
         self.opened = False
         self._connect()
     
+    def _get_base_url(self):
+        """Extract base URL (without /stream path)."""
+        import urllib.parse
+        parsed = urllib.parse.urlparse(self.url)
+        return f"http://{parsed.hostname}:{parsed.port or 80}"
+    
+    def _check_and_disconnect_previous(self):
+        """Check if stream is busy and force disconnect if needed."""
+        base_url = self._get_base_url()
+        try:
+            status_resp = requests.get(f"{base_url}/status", timeout=2)
+            if status_resp.ok:
+                status = status_resp.json()
+                if status.get("streaming", False):
+                    print("   ⚠️ Stream busy, disconnecting previous client...")
+                    requests.get(f"{base_url}/disconnect", timeout=2)
+                    time.sleep(0.5)
+                    return True
+        except Exception:
+            pass
+        return False
+    
     def _connect(self):
         try:
-            self.stream = requests.get(self.url, stream=True, timeout=5)
-            if self.stream.status_code == 200:
-                self.opened = True
-                self.bytes_buffer = bytes()
+            # Force disconnect any previous client
+            self._check_and_disconnect_previous()
+            
+            # Use OpenCV's VideoCapture which handles MJPEG internally
+            # Set buffer size to 1 to always get latest frame
+            self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            if self.cap.isOpened():
+                # Read one frame to verify connection
+                ret, _ = self.cap.read()
+                if ret:
+                    self.opened = True
+                    print(f"   ✓ Stream connected: {self.url}")
+                else:
+                    print(f"   ⚠️ Stream opened but no frames")
+                    self.opened = True  # Keep trying
+            else:
+                print(f"   ❌ Failed to open stream: {self.url}")
+                self.opened = False
         except Exception as e:
-            print(f"MJPEG connection failed: {e}")
+            print(f"   ❌ Stream error: {e}")
             self.opened = False
     
     def isOpened(self):
-        return self.opened
+        return self.opened and self.cap is not None and self.cap.isOpened()
     
     def read(self):
-        if not self.opened:
+        """Read a frame - OpenCV handles MJPEG parsing."""
+        if not self.isOpened():
             return False, None
         
         try:
-            # Read chunks from stream
-            for chunk in self.stream.iter_content(chunk_size=1024):
-                self.bytes_buffer += chunk
-                
-                # Find JPEG boundaries
-                a = self.bytes_buffer.find(b'\xff\xd8')  # JPEG start
-                b = self.bytes_buffer.find(b'\xff\xd9')  # JPEG end
-                
-                if a != -1 and b != -1:
-                    jpg = self.bytes_buffer[a:b+2]
-                    self.bytes_buffer = self.bytes_buffer[b+2:]
-                    
-                    # Decode JPEG
-                    frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        return True, frame
+            # Grab and retrieve to minimize latency
+            if self.cap.grab():
+                ret, frame = self.cap.retrieve()
+                return ret, frame
             return False, None
-        except Exception as e:
-            self.opened = False
+        except Exception:
             return False, None
     
     def release(self):
+        """Release the stream."""
+        if self.cap:
+            self.cap.release()
         self.opened = False
-        if self.stream:
-            self.stream.close()
+        
+        # Signal ESP32-CAM we're done
+        try:
+            base_url = self._get_base_url()
+            requests.get(f"{base_url}/disconnect", timeout=1)
+        except:
+            pass
 
 
 # ============== CAMERA STREAM (ESP32-CAM) ==============
@@ -628,32 +677,24 @@ class CameraStream:
         else:
             print("ℹ️ ESP32-CAM IP not set, using local webcam")
         
-        # Fall back to local webcam
-        if not self.connected and use_local:
+        # ALWAYS fall back to local webcam if ESP32-CAM fails
+        if not self.connected:
             self._connect_local()
     
     def _connect_esp_cam(self):
-        """Connect to ESP32-CAM MJPEG stream with custom reader."""
+        """Connect to ESP32-CAM MJPEG stream."""
         self.stream_url = f"http://{self.cam_ip}:{Config.CAM_PORT}/stream"
         print(f"🔍 Trying ESP32-CAM at {self.cam_ip}...")
         try:
-            # Test connection with short timeout
-            test_url = f"http://{self.cam_ip}:{Config.CAM_PORT}/"
-            urllib.request.urlopen(test_url, timeout=3)
-            
-            # Use custom MJPEG reader for ESP32-CAM
-            self.cap = MJPEGStreamReader(self.stream_url)
+            # Use custom MJPEG reader (more reliable for ESP32-CAM)
+            self.cap = MJPEGStreamReader(self.stream_url, timeout=15)
             if self.cap.isOpened():
                 print(f"📹 ESP32-CAM connected: {self.cam_ip}")
                 self.connected = True
                 self.source = "esp32cam"
             else:
-                print(f"⚠️ ESP32-CAM stream failed: {self.stream_url}")
-                print("   Hint: Make sure ESP32-CAM is powered and on same network")
-        except urllib.error.URLError as e:
-            print(f"⚠️ ESP32-CAM not reachable at {self.cam_ip}")
-            print(f"   Error: {e.reason}")
-            print("   Hint: Check if ESP32-CAM is powered and connected to WiFi")
+                print(f"⚠️ ESP32-CAM stream failed")
+                print("   Tip: Reset ESP32-CAM (press reset button) and try again")
         except Exception as e:
             print(f"⚠️ ESP32-CAM connection error: {e}")
     
@@ -674,10 +715,18 @@ class CameraStream:
             print("❌ No camera available")
     
     def read(self):
-        """Read a frame from the camera."""
+        """Read a frame from the camera, with brightness enhancement for ESP32-CAM."""
         if self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
+                # Enhance ESP32-CAM image (it's typically dull/dark)
+                if self.source == "esp32cam" and frame is not None:
+                    # Increase brightness and contrast
+                    # Formula: new_pixel = alpha * pixel + beta
+                    # alpha > 1 increases contrast, beta > 0 increases brightness
+                    alpha = 1.3  # Contrast boost
+                    beta = 30    # Brightness boost
+                    frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
                 return True, frame
         return False, None
     
@@ -711,9 +760,8 @@ def draw_oled_simulation(img, face: str, x=10, y=80):
         # Happy eyes ^_^
         cv2.ellipse(img, (cx - eye_spacing, cy - 5), (8, 10), 0, 180, 360, (0, 255, 100), 2)
         cv2.ellipse(img, (cx + eye_spacing, cy - 5), (8, 10), 0, 180, 360, (0, 255, 100), 2)
-        # Smile
-        cv2.ellipse(img, (cx, cy + 12), (15, 8), 0, 0, 180, (0, 255, 100), 2)
-        
+        # Smile (upward curve)
+        cv2.ellipse(img, (cx, cy + 15), (12, 6), 0, 0, 180, (0, 255, 100), 2)        
     elif face == "SAD":
         # Sad droopy eyes
         cv2.ellipse(img, (cx - eye_spacing, cy - 5), (8, 5), 0, 0, 180, (100, 100, 255), 2)
@@ -745,8 +793,8 @@ def draw_oled_simulation(img, face: str, x=10, y=80):
                 (cx + eye_spacing, cy + 2)]
         cv2.fillPoly(img, [np.array(pts1)], (180, 100, 255))
         cv2.fillPoly(img, [np.array(pts2)], (180, 100, 255))
-        # Blush smile
-        cv2.ellipse(img, (cx, cy + 12), (12, 6), 0, 0, 180, (180, 100, 255), 2)
+        # Blush smile (upward)
+        cv2.ellipse(img, (cx, cy + 15), (12, 6), 0, 0, 180, (180, 100, 255), 2)
         
     elif face == "LISTENING":
         # Attentive eyes with raised eyebrows
@@ -774,6 +822,15 @@ def draw_oled_simulation(img, face: str, x=10, y=80):
     
     # Label
     cv2.putText(img, face, (x + 5, y + oled_h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    # Debug overlay: show raw repr and byte values when enabled
+    try:
+        if globals().get('SHOW_FACE_DEBUG', False):
+            raw = repr(face)
+            bytes_str = ' '.join([str(ord(c)) for c in face])
+            cv2.putText(img, raw, (x + 5, y + oled_h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 180, 100), 1)
+            cv2.putText(img, bytes_str, (x + 5, y + oled_h + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (120, 120, 80), 1)
+    except Exception:
+        pass
 
 
 def draw_led_simulation(img, x=10, y=160):
@@ -1030,19 +1087,30 @@ class WakeWordDetector:
     def __init__(self, callback):
         self.callback = callback
         self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
+        self.microphone = None  # Create fresh microphone each time
         self.running = False
         self._stop_listening = None
+        self._calibrated = False
     
     def start(self):
         if not SR_AVAILABLE:
             return
         if self._stop_listening is not None:
             return  # Already running
+        
         self.running = True
         
-        with self.microphone as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+        # Create fresh microphone instance
+        self.microphone = sr.Microphone()
+        
+        # Calibrate for ambient noise
+        if not self._calibrated:
+            try:
+                with self.microphone as source:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                self._calibrated = True
+            except Exception as e:
+                print(f"⚠️ Microphone calibration failed: {e}")
         
         def audio_callback(recognizer, audio):
             if not self.running:
@@ -1079,6 +1147,8 @@ class WakeWordDetector:
             except Exception:
                 pass
             self._stop_listening = None
+        # Release microphone for reuse
+        self.microphone = None
 
     def cleanup(self):
         """Cleanup wake word detector resources."""
@@ -1114,6 +1184,8 @@ class LiveConversation:
             raise RuntimeError("GEMINI_API_KEY not set in environment")
         
         # Use v1alpha API version for native audio
+        # Note: WebSocket keepalive timeouts may occur during long conversations
+        # This is a known limitation of the Gemini Live API
         self.client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
         
         # Audio setup for Mac
@@ -1205,6 +1277,7 @@ class LiveConversation:
     
     async def _receive_audio(self):
         """Receive audio responses from Gemini and queue for playback."""
+        is_ai_talking = False
         try:
             while self.running:
                 turn = self.session.receive()
@@ -1215,25 +1288,32 @@ class LiveConversation:
                     # Handle audio data
                     if response.data:
                         self.audio_in_queue.put_nowait(response.data)
-                        # Tell robot we're speaking
-                        if self.robot:
+                        # Tell robot we're speaking - ONLY if state changed
+                        if self.robot and not is_ai_talking:
                             self.robot.talk_start()
+                            is_ai_talking = True
                         continue
                     
-                    # Handle text (for debugging)
-                    if response.text:
-                        print(f"🤖 {response.text}")
-                        # Parse for light control commands
-                        self._parse_light_commands(response.text)
+                    # Handle server content (text from native audio model)
+                    if response.server_content:
+                        if response.server_content.model_turn:
+                            for part in response.server_content.model_turn.parts:
+                                if part.text:
+                                    print(f"🤖 {part.text}")
+                                    # Parse for light control commands
+                                    self._parse_light_commands(part.text)
                 
-                # Turn complete - stop talking animation
+                # Turn complete
+                # Wait for audio queue to be drained before stopping talking animation
+                while not self.audio_in_queue.empty():
+                    await asyncio.sleep(0.1)  # Checking more frequently for smoother transition
+                
                 if self.robot:
                     self.robot.talk_stop()
+                is_ai_talking = False
                 
-                # Clear audio queue on turn complete (for interruptions)
-                while not self.audio_in_queue.empty():
-                    self.audio_in_queue.get_nowait()
-                    
+                # ONLY clear if we're actually starting a new user turn or interrupted
+                # (The server turn is finished, so we don't need to clear here unless we're handling interruptions)
         except Exception as e:
             if self.running:
                 print(f"❌ Receive error: {e}")
@@ -1385,6 +1465,7 @@ class LiveConversation:
         face_match = re.search(r'\[(?:FACE|EMOTION):(\w+)\]', text, re.IGNORECASE)
         if face_match:
             emotion = face_match.group(1).lower()
+            print(f"🔍 Face/Emotion command from AI: {emotion}")
             self.robot.set_emotion(emotion)
         
         # Display text on OLED: [DISPLAY:Hello!]
@@ -1402,29 +1483,39 @@ class LiveConversation:
             self.stop()
     
     def _auto_detect_emotion(self, text: str):
-        """Automatically detect emotion from response and update face."""
+        """Automatically detect emotion from response and update face.
+        Uses conservative rules to avoid false SAD assignments for polite phrases.
+        """
         if not self.robot:
             return
-        
+
         text_lower = text.lower()
-        
-        # Priority-ordered emotion keywords
-        emotion_keywords = [
-            # Love expressions
-            (['love', 'adore', '❤', '💕', 'heart', 'sweet'], 'LOVE'),
-            # Sad expressions
-            (['sorry', 'sad', 'unfortunately', 'regret', 'apologize', 'condolence'], 'SAD'),
-            # Happy expressions (lower priority - most common)
-            (['happy', 'glad', 'great', 'wonderful', 'excellent', 'fantastic', 'amazing', 'haha', 'laugh', '😊', '😄'], 'HAPPY'),
-        ]
-        
-        for keywords, face in emotion_keywords:
-            for keyword in keywords:
-                if keyword in text_lower:
-                    # Only change if different from current (avoid spam)
-                    if RobotController.current_face != face:
-                        self.robot.set_face(face)
-                    return
+        # Debug short sample
+        debug_sample = text_lower.strip()[:200]
+        # Define keyword groups
+        sad_keywords = ['sorry', 'sad', 'unfortunately', 'regret', 'apologize', 'condolence', 'sympathy', 'sorrow', '😢', '😭']
+        neg_words = ['not', 'no', 'never', "can't", "cannot", "don't", "didn't", "won't", 'unable', 'fail']
+        love_keywords = ['love', 'adore', '❤', '💕', 'heart', 'sweet']
+        happy_keywords = ['happy', 'glad', 'great', 'wonderful', 'excellent', 'fantastic', 'amazing', 'haha', 'laugh', '😊', '😄']
+
+        sad_count = sum(text_lower.count(k) for k in sad_keywords)
+        neg_count = sum(text_lower.count(k) for k in neg_words)
+
+        # Determine sad only for stronger signals: at least 2 sad keywords OR 'sorry' with negative context
+        if sad_count >= 2 or ('sorry' in text_lower and neg_count > 0):
+            face = 'SAD'
+        elif any(k in text_lower for k in love_keywords):
+            face = 'LOVE'
+        elif any(k in text_lower for k in happy_keywords):
+            face = 'HAPPY'
+        else:
+            # Nothing strong enough to change emotion
+            return
+
+        # Only change if different (avoid spam) and log decision
+        if RobotController.current_face != face:
+            print(f"📺 Auto-detected emotion: {face} (sad_count={sad_count}, neg_count={neg_count}) => sample: '{debug_sample}')")
+            self.robot.set_face(face)
     
     async def start_session(self):
         """Start the Live API session with audio streaming."""
@@ -1433,8 +1524,10 @@ class LiveConversation:
         print(f"\n🎙️  Starting Gemini Live conversation ({audio_mode} audio)...")
         
         if self.robot:
-            self.robot.set_face("LISTENING")
-            # Don't change LED color - keep current color
+            self.robot.set_face("HAPPY")
+            # Explicitly keep LED white when starting chat
+            self.robot.set_color_name("white")
+            print("💡 Chat start - ensuring LED stays white")
             # If using ESP32 audio, tell it to start streaming
             if self.use_esp32_audio:
                 print("📡 Starting ESP32 audio streaming...")
@@ -1458,7 +1551,7 @@ class LiveConversation:
                 
                 # Initialize queues
                 self.audio_in_queue = asyncio.Queue()
-                self.audio_out_queue = asyncio.Queue(maxsize=5)
+                self.audio_out_queue = asyncio.Queue(maxsize=10)  # Moderate buffer for smooth audio
                 
                 async with asyncio.TaskGroup() as tg:
                     # Start audio tasks based on mode
@@ -1482,9 +1575,14 @@ class LiveConversation:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"❌ Live session error: {e}")
-            import traceback
-            traceback.print_exc()
+            error_msg = str(e).lower()
+            if "keepalive ping timeout" in error_msg or "websocket" in error_msg or "1011" in error_msg:
+                print(f"❌ WebSocket connection timeout - this is a known issue with long conversations")
+                print(f"💡 Try restarting the conversation or check your internet connection")
+            else:
+                print(f"❌ Live session error: {e}")
+                import traceback
+                traceback.print_exc()
         finally:
             self.running = False
             # Stop ESP32 audio streaming
@@ -1492,6 +1590,7 @@ class LiveConversation:
                 self.robot.send_command("AUDIO_STOP")
             if self.robot:
                 self.robot.set_face("HAPPY")
+                print(f"📺 End session - setting face to HAPPY")
             print("💬 Live session ended")
     
     def stop(self):
@@ -1542,9 +1641,13 @@ def main():
     # Initialize components
     controller = RobotController()
     
+    # Test mode variables
+    current_test_face = 0
+    
     # Set default white LED on startup
     controller.set_brightness(80)
     controller.set_color_name("white")
+    print(f"💡 Startup LED: Brightness=80, Color=white (255,255,255)")
     
     # Send startup greeting to eyes display
     controller.send_command("TEXT:Hi Lumina")
@@ -1566,6 +1669,8 @@ def main():
     state_lock = threading.Lock()  # Thread-safe state changes
     wake_word_triggered = threading.Event()  # Signal when wake word detected
     touch_triggered = threading.Event()  # Signal when touch sensor triggered
+    # Debug: overlay raw face repr and byte list
+    SHOW_FACE_DEBUG = False
     
     # Wake word callback - just set flag, don't stop detector here
     def on_wake_word():
@@ -1603,6 +1708,8 @@ def main():
     print("\n🎮 Controls:")
     print("   �️  Say 'Hey Lumina' - Start live conversation")
     print("   Press 'v' - Start live conversation (manual)")
+    print("   Press 't' - Test OLED emotions (cycle through all faces)")
+    print("   Press 'd' - Toggle face debug overlay (raw repr + bytes)")
     print("   Press 'e' - End conversation")
     print("   Press 'q' - Quit")
     print("-" * 55)
@@ -1620,11 +1727,21 @@ def main():
             current_state = State.IDLE
             # Wake detector continues running in background, no need to resume
     
+    frame_fail_count = 0
+    MAX_FAIL_FRAMES = 30  # Tolerate some dropped frames
+    
     while camera.isOpened():
         success, img = camera.read()
         if not success:
+            frame_fail_count += 1
+            if frame_fail_count > MAX_FAIL_FRAMES:
+                print(f"⚠️ Camera stream stalled ({frame_fail_count} failed reads)")
+                frame_fail_count = 0  # Reset and keep trying
+            # Small delay to avoid CPU spin when no frames
+            time.sleep(0.01)
             continue
         
+        frame_fail_count = 0  # Reset on success
         img = cv2.flip(img, 1)
         h, w, _ = img.shape
         
@@ -1634,6 +1751,19 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        if key == ord('t'):
+            # Emotion test mode - cycle through all faces
+            test_faces = ['HAPPY', 'SAD', 'LOVE', 'LISTENING', 'TALKING', 'SLEEP']
+            face = test_faces[current_test_face]
+            controller.set_face(face)
+            current_test_face = (current_test_face + 1) % len(test_faces)
+            print(f"🧪 Testing emotion: {face}")
+            time.sleep(1)  # Brief pause to see each emotion
+        if key == ord('d'):
+            # Toggle face debug overlay
+            current = globals().get('SHOW_FACE_DEBUG', False)
+            globals()['SHOW_FACE_DEBUG'] = not current
+            print(f"🔧 SHOW_FACE_DEBUG = {globals().get('SHOW_FACE_DEBUG')}")
         if key == ord('v') and not live_conversation:
             # Manual start (useful when no touch sensor available)
             print("\n🟢 Manual start requested (key 'v')")
@@ -1722,12 +1852,8 @@ def main():
                 with state_lock:
                     current_state = State.TRACKING
                 controller.move(pan, tilt)
-                if last_state != State.TRACKING:
-                    controller.set_face("HAPPY")
             else:
                 # Keep servo at last position when hand removed (don't reset to 90)
-                if local_state == State.TRACKING:
-                    controller.set_face("SLEEP")
                 with state_lock:
                     current_state = State.IDLE
             

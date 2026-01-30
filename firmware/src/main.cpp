@@ -387,10 +387,7 @@ void setupWiFi() {
     Serial.print("  IP: ");
     Serial.println(WiFi.localIP());
     
-    // Success - green flash
-    fill_solid(leds, NUM_LEDS, CRGB::Green);
-    FastLED.show();
-    delay(500);
+    // WiFi connected - keep current LED color (no flash)
 }
 
 // ============== OTA SETUP ==============
@@ -719,7 +716,7 @@ void parseCommand(String cmd) {
     
     if (cmd == "F_LISTENING") {
         currentFace = FACE_LISTENING;
-        currentColor = CRGB::Green;
+        // Don't change LED color - keep current color
         drawFace();
         return;
     }
@@ -807,7 +804,7 @@ void parseCommand(String cmd) {
     if (cmd == "CHAT_STOP") {
         chatMode = false;
         isTalking = false;
-        currentColor = CRGB::White;
+        // Don't change LED color - keep current color
         currentFace = FACE_SLEEP;
         // Mute amp for remote chat stop
         digitalWrite(PIN_AMP_EN, LOW);
@@ -1129,54 +1126,34 @@ void parseCommand(String cmd) {
         return;
     }
     
-    // SERVO_PAN:angle - 180° position servo (0-180°) - instant movement for tracking
+    // SERVO_PAN:angle - 180° position servo (0-180°) - smooth movement for tracking
     if (cmd.startsWith("SERVO_PAN:")) {
         if (!panServo.attached()) {
             Serial.println("Pan servo disabled - send SERVO_ENABLE first");
             return;
         }
-        int targetAngle = cmd.substring(10).toInt();
-        if (targetAngle < 0 || targetAngle > 180) {
-            Serial.printf("Invalid pan angle %d (use 0-180)\n", targetAngle);
+        int angle = cmd.substring(10).toInt();
+        if (angle < 0 || angle > 180) {
+            Serial.printf("Invalid pan angle %d (use 0-180)\n", angle);
             return;
         }
         
-        // Instant movement for responsive tracking (no delay)
-        panServo.write(targetAngle);
-        currentPanAngle = targetAngle;
+        // Set target for smooth movement (updateServos() will interpolate)
+        targetPan = angle;
+        
         // Only print occasionally to avoid serial bottleneck
         static unsigned long lastPanPrint = 0;
         if (millis() - lastPanPrint > 500) {
-            Serial.printf("Pan: %d°\n", targetAngle);
+            Serial.printf("Pan target: %d°\n", angle);
             lastPanPrint = millis();
         }
         return;
     }
     
-    // SERVO_TILT:angle - 180° position servo (30-150°) - instant movement for tracking
+    // SERVO_TILT:angle - DISABLED (tilt servo fixed at center)
     if (cmd.startsWith("SERVO_TILT:")) {
-        if (!tiltServo.attached()) {
-            Serial.println("Tilt servo disabled - send SERVO_ENABLE first");
-            return;
-        }
-        int targetAngle = cmd.substring(11).toInt();
-        if (targetAngle < 30 || targetAngle > 150) {
-            Serial.printf("Invalid tilt angle %d (use 30-150)\n", targetAngle);
-            return;
-        }
-        
-        // Invert tilt direction (flip the servo)
-        int invertedAngle = 180 - targetAngle;
-        
-        // Instant movement for responsive tracking (no delay)
-        tiltServo.write(invertedAngle);
-        currentTiltAngle = invertedAngle;
-        // Only print occasionally to avoid serial bottleneck
-        static unsigned long lastTiltPrint = 0;
-        if (millis() - lastTiltPrint > 500) {
-            Serial.printf("Tilt: %d° (inv: %d°)\n", targetAngle, invertedAngle);
-            lastTiltPrint = millis();
-        }
+        // Tilt servo is disabled - ignore command
+        Serial.println("Tilt servo disabled");
         return;
     }
     
@@ -1204,11 +1181,25 @@ void parseCommand(String cmd) {
 }
 
 // ============== SERVO UPDATE ==============
-// For 360° continuous rotation servos, movement is handled directly in commands
-// This function is kept for compatibility but does nothing for continuous rotation
+// Smooth servo movement with interpolation
 void updateServos() {
-    // 360° servos don't need position updates - they're controlled via timed pulses
-    // Movement commands (PAN_LEFT, TILT_UP, etc.) handle start/stop directly
+    // Smoothing factor (lower = smoother, higher = faster)
+    // 0.1 = very smooth, 0.5 = balanced, 1.0 = instant
+    const float smoothing = 0.15;  // Slow and smooth
+    
+    // Pan servo - smooth movement
+    if (abs(targetPan - currentPan) > 1) {
+        currentPan += (targetPan - currentPan) * smoothing;
+        if (panServo.attached()) {
+            panServo.write(currentPan);
+        }
+    }
+    
+    // Tilt servo - DISABLED (no movement)
+    // Keep tilt at center position
+    if (tiltServo.attached()) {
+        tiltServo.write(90);  // Fixed center position
+    }
 }
 
 // ============== LED UPDATE ==============

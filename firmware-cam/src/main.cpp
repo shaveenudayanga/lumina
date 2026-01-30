@@ -14,6 +14,7 @@
 #include <WiFiManager.h>
 #include <WiFiMulti.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
@@ -45,6 +46,21 @@ WiFiManager wifiManager;
 WiFiMulti wifiMulti;
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
+
+// Stream client tracking - ESP32-CAM can only serve ONE client at a time
+volatile bool stream_client_connected = false;
+volatile unsigned long last_frame_time = 0;
+const unsigned long STREAM_TIMEOUT_MS = 10000;  // Auto-disconnect after 10s of no frames
+
+// WiFi reconnect tracking
+volatile int wifi_fail_count = 0;
+const int WIFI_MAX_FAILS = 6; // Reboot after this many failed reconnect attempts
+
+// MJPEG boundary - standard format for reliable parsing
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 // ============== MULTI-NETWORK CONFIG ==============
 // Add your WiFi networks here (SSID, password)
@@ -83,12 +99,12 @@ bool initCamera() {
     // Optimized for LOW LATENCY hand tracking
     if (psramFound()) {
         config.frame_size = FRAMESIZE_QVGA;  // 320x240 - FASTER!
-        config.jpeg_quality = 20;  // Higher = faster encoding, lower quality
+        config.jpeg_quality = 12;  // Lower = better compression = faster transfer (10-15 ideal)
         config.fb_count = 2;  // Double buffer for smooth streaming
-        config.grab_mode = CAMERA_GRAB_LATEST;  // Always get latest frame
+        config.grab_mode = CAMERA_GRAB_LATEST;  // Always get latest frame (skips stale frames)
     } else {
-        config.frame_size = FRAMESIZE_QVGA;
-        config.jpeg_quality = 25;
+        config.frame_size = FRAMESIZE_QQVGA;  // Even smaller without PSRAM
+        config.jpeg_quality = 15;
         config.fb_count = 1;
     }
     
@@ -99,30 +115,30 @@ bool initCamera() {
         return false;
     }
     
-    // Sensor settings for better image
+    // Sensor settings - OPTIMIZED FOR BRIGHTER IMAGE
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
-        s->set_brightness(s, 0);     // -2 to 2
-        s->set_contrast(s, 0);       // -2 to 2
-        s->set_saturation(s, 0);     // -2 to 2
+        s->set_brightness(s, 2);     // -2 to 2 (MAX brightness)
+        s->set_contrast(s, 1);       // -2 to 2 (slightly higher contrast)
+        s->set_saturation(s, 1);     // -2 to 2 (slightly more color)
         s->set_special_effect(s, 0); // 0 = No Effect
         s->set_whitebal(s, 1);       // 0 = disable, 1 = enable
         s->set_awb_gain(s, 1);       // 0 = disable, 1 = enable
-        s->set_wb_mode(s, 0);        // 0 to 4
-        s->set_exposure_ctrl(s, 1);  // 0 = disable, 1 = enable
-        s->set_aec2(s, 0);           // 0 = disable, 1 = enable
-        s->set_ae_level(s, 0);       // -2 to 2
-        s->set_aec_value(s, 300);    // 0 to 1200
-        s->set_gain_ctrl(s, 1);      // 0 = disable, 1 = enable
-        s->set_agc_gain(s, 0);       // 0 to 30
-        s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
-        s->set_bpc(s, 0);            // 0 = disable, 1 = enable
-        s->set_wpc(s, 1);            // 0 = disable, 1 = enable
-        s->set_raw_gma(s, 1);        // 0 = disable, 1 = enable
-        s->set_lenc(s, 1);           // 0 = disable, 1 = enable
+        s->set_wb_mode(s, 0);        // 0 = Auto WB
+        s->set_exposure_ctrl(s, 1);  // 0 = disable, 1 = enable auto exposure
+        s->set_aec2(s, 1);           // Enable AEC DSP (better auto exposure)
+        s->set_ae_level(s, 2);       // -2 to 2 (MAX auto exposure level)
+        s->set_aec_value(s, 600);    // 0 to 1200 (higher = brighter)
+        s->set_gain_ctrl(s, 1);      // 0 = disable, 1 = enable auto gain
+        s->set_agc_gain(s, 15);      // 0 to 30 (higher gain = brighter but more noise)
+        s->set_gainceiling(s, (gainceiling_t)6);  // 0 to 6 (MAX gain ceiling)
+        s->set_bpc(s, 1);            // Bad pixel correction
+        s->set_wpc(s, 1);            // White pixel correction
+        s->set_raw_gma(s, 1);        // Gamma correction
+        s->set_lenc(s, 1);           // Lens correction
         s->set_hmirror(s, 0);        // 0 = disable, 1 = enable
         s->set_vflip(s, 1);          // 0 = disable, 1 = enable (FLIPPED UPSIDE DOWN)
-        s->set_dcw(s, 1);            // 0 = disable, 1 = enable
+        s->set_dcw(s, 1);            // Downsize enable
         s->set_colorbar(s, 0);       // 0 = disable, 1 = enable
     }
     
@@ -163,65 +179,133 @@ static esp_err_t index_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+    // Single-client enforcement: reject if another client is streaming
+    if (stream_client_connected) {
+        Serial.println("⚠️ Stream rejected: another client is already connected");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "Stream busy - only one client supported", HTTPD_RESP_USE_STRLEN);
+    }
+    
+    stream_client_connected = true;
+    last_frame_time = millis();
+    Serial.println("📹 Stream client connected");
+    
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     size_t _jpg_buf_len = 0;
     uint8_t * _jpg_buf = NULL;
-    char * part_buf[64];
+    char part_buf[64];
+    unsigned long frame_count = 0;
+    int64_t last_frame_us = esp_timer_get_time();
 
-    res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+    // Set headers for MJPEG stream - use proper boundary format
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
+        stream_client_connected = false;
         return res;
     }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
 
-    while (true) {
+    while (stream_client_connected) {
+        // Get latest frame (CAMERA_GRAB_LATEST skips old frames)
         fb = esp_camera_fb_get();
         if (!fb) {
             Serial.println("Camera capture failed");
-            res = ESP_FAIL;
-        } else {
-            if (fb->format != PIXFORMAT_JPEG) {
-                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                esp_camera_fb_return(fb);
-                fb = NULL;
-                if (!jpeg_converted) {
-                    Serial.println("JPEG compression failed");
-                    res = ESP_FAIL;
-                }
-            } else {
-                _jpg_buf_len = fb->len;
-                _jpg_buf = fb->buf;
-            }
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;  // Try again instead of breaking
         }
+        
+        _jpg_buf_len = fb->len;
+        _jpg_buf = fb->buf;
+        
+        // Send boundary
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        
+        // Send part header with content length
         if (res == ESP_OK) {
-            size_t hlen = snprintf((char *)part_buf, 64, "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", _jpg_buf_len);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+            size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, _jpg_buf_len);
+            res = httpd_resp_send_chunk(req, part_buf, hlen);
         }
+        
+        // Send JPEG data
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
         }
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, "\r\n--frame\r\n", 13);
-        }
-        if (fb) {
-            esp_camera_fb_return(fb);
-            fb = NULL;
-            _jpg_buf = NULL;
-        } else if (_jpg_buf) {
-            free(_jpg_buf);
-            _jpg_buf = NULL;
-        }
+        
+        // Return frame buffer immediately
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        
+        // Check for send errors (client disconnected)
         if (res != ESP_OK) {
+            Serial.println("Client disconnected");
             break;
         }
+        
+        // Update stats
+        frame_count++;
+        
+        // Yield to WiFi stack - CRITICAL for stable streaming
+        vTaskDelay(1);
+        
+        // FPS calculation every 100 frames
+        if (frame_count % 100 == 0) {
+            int64_t now_us = esp_timer_get_time();
+            float fps = 100.0f * 1000000.0f / (now_us - last_frame_us);
+            last_frame_us = now_us;
+            Serial.printf("📊 Stream: %.1f FPS, %u KB avg\n", fps, _jpg_buf_len / 1024);
+        }
     }
+    
+    // Cleanup on exit
+    stream_client_connected = false;
+    Serial.printf("📹 Stream ended: %lu frames\n", frame_count);
     return res;
+}
+
+// Status endpoint - check if stream is available
+static esp_err_t status_handler(httpd_req_t *req) {
+    char json[256];
+    snprintf(json, sizeof(json), 
+        "{\"streaming\":%s,\"uptime\":%lu,\"heap\":%u,\"psram\":%u}",
+        stream_client_connected ? "true" : "false",
+        millis() / 1000,
+        ESP.getFreeHeap(),
+        ESP.getFreePsram());
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json, strlen(json));
+}
+
+// Force disconnect current stream client
+static esp_err_t disconnect_handler(httpd_req_t *req) {
+    if (stream_client_connected) {
+        stream_client_connected = false;  // Signal stream loop to exit
+        httpd_resp_sendstr(req, "Stream client disconnected");
+    } else {
+        httpd_resp_sendstr(req, "No client connected");
+    }
+    return ESP_OK;
+}
+
+// Reboot handler - top-level (so it compiles correctly)
+static esp_err_t reboot_handler(httpd_req_t *req) {
+    httpd_resp_sendstr(req, "Rebooting");
+    // give client time to receive
+    delay(100);
+    esp_restart();
+    return ESP_OK;
 }
 
 // ============== START WEB SERVER ==============
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
+    config.stack_size = 8192;  // Larger stack for stream handling
+    config.max_uri_handlers = 8;
 
     httpd_uri_t index_uri = {
         .uri       = "/",
@@ -236,12 +320,41 @@ void startCameraServer() {
         .handler   = stream_handler,
         .user_ctx  = NULL
     };
+    
+    httpd_uri_t status_uri = {
+        .uri       = "/status",
+        .method    = HTTP_GET,
+        .handler   = status_handler,
+        .user_ctx  = NULL
+    };
+    
+    httpd_uri_t disconnect_uri = {
+        .uri       = "/disconnect",
+        .method    = HTTP_GET,
+        .handler   = disconnect_handler,
+        .user_ctx  = NULL
+    };
+
+    // Reboot endpoint
+    httpd_uri_t reboot_uri = {
+        .uri       = "/reboot",
+        .method    = HTTP_GET,
+        .handler   = reboot_handler,
+        .user_ctx  = NULL
+    };
 
     Serial.printf("Starting web server on port %d\n", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(camera_httpd, &index_uri);
         httpd_register_uri_handler(camera_httpd, &stream_uri);
+        httpd_register_uri_handler(camera_httpd, &status_uri);
+        httpd_register_uri_handler(camera_httpd, &disconnect_uri);
+        httpd_register_uri_handler(camera_httpd, &reboot_uri);
         Serial.println("✓ Camera server started");
+        Serial.println("   /stream    - MJPEG video stream");
+        Serial.println("   /status    - JSON status (check if busy)");
+        Serial.println("   /disconnect - Force disconnect current client");
+        Serial.println("   /reboot    - Reboot device");
     }
 }
 
@@ -300,6 +413,14 @@ void setupWiFi() {
     Serial.println(WiFi.localIP());
     Serial.print("  Hostname: ");
     Serial.println(HOSTNAME);
+
+    // Announce mDNS name for easier discovery on LAN
+    if (MDNS.begin(HOSTNAME)) {
+        Serial.println("✓ mDNS responder started");
+        MDNS.addService("http", "tcp", 80);
+    } else {
+        Serial.println("⚠️ mDNS failed to start");
+    }
 }
 
 // ============== OTA SETUP ==============
@@ -371,5 +492,25 @@ void setup() {
 // ============== LOOP ==============
 void loop() {
     ArduinoOTA.handle();
+
+    // Ensure WiFi stays connected; try reconnecting if lost
+    if (WiFi.status() != WL_CONNECTED) {
+        wifi_fail_count++;
+        Serial.printf("⚠️ WiFi disconnected (%d/%d), attempting reconnect...\n", wifi_fail_count, WIFI_MAX_FAILS);
+        if (wifiMulti.run(5000) == WL_CONNECTED) {
+            Serial.println("✓ WiFi reconnected");
+            wifi_fail_count = 0;
+        } else {
+            Serial.println("   reconnect attempt failed");
+            if (wifi_fail_count >= WIFI_MAX_FAILS) {
+                Serial.println("⚠️ WiFi failed repeatedly, restarting device...");
+                delay(2000);
+                ESP.restart();
+            }
+        }
+    } else {
+        wifi_fail_count = 0; // reset counter when connected
+    }
+
     delay(10);
 }
