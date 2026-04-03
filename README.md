@@ -175,6 +175,12 @@ python test_esp32.py
     └── src/main.cpp
 ```
 
+# Team
+
+- Shaveen Udayanga 
+- Sadish Shamal
+- Nimnadi Pathirana 
+
 ## License
 
 MIT - See [LICENSE](LICENSE)
